@@ -6,7 +6,20 @@ from .volume_rendering_utils import volume_render_radiance_field
 
 
 def run_network(network_fn, pts, ray_batch, chunksize, embed_fn, embeddirs_fn):
+    """
+    Batchify the sampled points `"pts"` and forward network `"network_fn"` for each batch.
 
+    :param torch.nn.Module network_fn: network to forward (usually either the coarse or fine NeRF)
+    :param torch.Tensor pts: point samples to query (Rays per image * samples per ray)
+    :param torch.Tensor ray_batch: 11D rays used for the sampled points
+    :param int chunksize: maximum number of sample points per batch
+    :param None | function embed_fn: positional encoding of points positions
+    :param None | function embeddirs_fn: positional encoding of rays view directions
+    :return: radiance_field, radiance_field_penultimate
+    :rtype: tuple[torch.Tensor]
+    """
+
+    ### Apply positional encoding ##################################
     pts_flat = pts.reshape((-1, pts.shape[-1]))
     embedded = embed_fn(pts_flat)
     if embeddirs_fn is not None:
@@ -15,26 +28,53 @@ def run_network(network_fn, pts, ray_batch, chunksize, embed_fn, embeddirs_fn):
         input_dirs_flat = input_dirs.reshape((-1, input_dirs.shape[-1]))
         embedded_dirs = embeddirs_fn(input_dirs_flat)
         embedded = torch.cat((embedded, embedded_dirs), dim=-1)
+    ################################################################
 
-    batches = get_minibatches(embedded, chunksize=chunksize)
+    batches = get_minibatches(embedded, chunksize=chunksize)  # group sampled points into smaller batches
     preds = [network_fn(batch) for batch in batches]
+
+    preds_penultimate = [p[0] for p in preds]
+    preds = [p[-1] for p in preds]
+
     radiance_field = torch.cat(preds, dim=0)
     radiance_field = radiance_field.reshape(
         list(pts.shape[:-1]) + [radiance_field.shape[-1]]
     )
-    return radiance_field
+
+    radiance_field_penultimate = torch.cat(preds_penultimate, dim=0)
+    radiance_field_penultimate = radiance_field_penultimate.reshape(
+        list(pts.shape[:-1]) + [radiance_field_penultimate.shape[-1]]
+    )
+    return radiance_field, radiance_field_penultimate
 
 
 def predict_and_render_radiance(
-    ray_batch,
-    model_coarse,
-    model_fine,
-    options,
-    mode="train",
-    encode_position_fn=None,
-    encode_direction_fn=None,
+        ray_batch,
+        model_coarse,
+        model_fine,
+        options,
+        mode="train",
+        encode_position_fn=None,
+        encode_direction_fn=None,
 ):
-    # TESTED
+    """
+    Predict a subsample of an image from a batch of rays, one pixel for each. (default:1024 pixels).
+        - this function relies on `run_network()` for inferencing a subset of the radiance field ([Rays, Points,RGBa] where Rays are from `ray_batch`),and on `volume_render_radiance_field()` for rendering the predicted subset of the radiance field
+        - this function also samples the points for both coarse and fine models
+
+    :param torch.Tensor ray_batch: batch of rays to be sampled (default: 1024)
+    :param torch.nn.Module model_coarse:
+    :param None | torch.nn.Module model_fine:
+    :param nerf.cfgnode.CfgNode options: dictionary with all config parameters
+    :param str mode: "train" or "validation"
+    :param None | function encode_position_fn: positional encoding of points positions
+    :param None | function encode_direction_fn: positional encoding of rays view directions
+    :return: rgb_coarse, disp_coarse, acc_coarse, rgb_fine, disp_fine, acc_fine
+    :rtype: tuple[torch.Tensor]
+    """
+
+    ###################################################################################################################
+    ### TESTED ### Sample points for the coarse network (regular intervals + optional small perturbation) #############
     num_rays = ray_batch.shape[0]
     ro, rd = ray_batch[..., :3], ray_batch[..., 3:6]
     bounds = ray_batch[..., 6:8].view((-1, 1, 2))
@@ -55,7 +95,7 @@ def predict_and_render_radiance(
         z_vals = 1.0 / (1.0 / near * (1.0 - t_vals) + 1.0 / far * t_vals)
     z_vals = z_vals.expand([num_rays, getattr(options.nerf, mode).num_coarse])
 
-    if getattr(options.nerf, mode).perturb:
+    if getattr(options.nerf, mode).perturb:  # add NOISE in the intervals size
         # Get intervals between samples.
         mids = 0.5 * (z_vals[..., 1:] + z_vals[..., :-1])
         upper = torch.cat((mids, z_vals[..., -1:]), dim=-1)
@@ -65,8 +105,10 @@ def predict_and_render_radiance(
         z_vals = lower + (upper - lower) * t_rand
     # pts -> (num_rays, N_samples, 3)
     pts = ro[..., None, :] + rd[..., None, :] * z_vals[..., :, None]
+    ###################################################################################################################
 
-    radiance_field = run_network(
+    radiance_field_penultimate_coarse = None
+    radiance_field, radiance_field_penultimate_coarse = run_network(
         model_coarse,
         pts,
         ray_batch,
@@ -89,10 +131,12 @@ def predict_and_render_radiance(
         white_background=getattr(options.nerf, mode).white_background,
     )
 
-    rgb_fine, disp_fine, acc_fine = None, None, None
+    rgb_fine, disp_fine, acc_fine, radiance_field_penultimate_fine = None, None, None, None
     if getattr(options.nerf, mode).num_fine > 0:
         # rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
 
+        ###############################################################################################################
+        ### Sample points for the fine network ########################################################################
         z_vals_mid = 0.5 * (z_vals[..., 1:] + z_vals[..., :-1])
         z_samples = sample_pdf(
             z_vals_mid,
@@ -105,8 +149,9 @@ def predict_and_render_radiance(
         z_vals, _ = torch.sort(torch.cat((z_vals, z_samples), dim=-1), dim=-1)
         # pts -> (N_rays, N_samples + N_importance, 3)
         pts = ro[..., None, :] + rd[..., None, :] * z_vals[..., :, None]
+        ###############################################################################################################
 
-        radiance_field = run_network(
+        radiance_field, radiance_field_penultimate_fine = run_network(
             model_fine,
             pts,
             ray_batch,
@@ -114,6 +159,7 @@ def predict_and_render_radiance(
             encode_position_fn,
             encode_direction_fn,
         )
+
         rgb_fine, disp_fine, acc_fine, _, _ = volume_render_radiance_field(
             radiance_field,
             z_vals,
@@ -124,22 +170,46 @@ def predict_and_render_radiance(
             white_background=getattr(options.nerf, mode).white_background,
         )
 
-    return rgb_coarse, disp_coarse, acc_coarse, rgb_fine, disp_fine, acc_fine
+    if mode == "validation":
+        radiance_field_penultimate_coarse, radiance_field_penultimate_fine = None, None
+
+    return rgb_coarse, disp_coarse, acc_coarse, rgb_fine, disp_fine, acc_fine, radiance_field_penultimate_coarse, radiance_field_penultimate_fine
 
 
 def run_one_iter_of_nerf(
-    height,
-    width,
-    focal_length,
-    model_coarse,
-    model_fine,
-    ray_origins,
-    ray_directions,
-    options,
-    mode="train",
-    encode_position_fn=None,
-    encode_direction_fn=None,
+        height,
+        width,
+        focal_length,
+        model_coarse,
+        model_fine,
+        ray_origins,
+        ray_directions,
+        options,
+        mode="train",
+        encode_position_fn=None,
+        encode_direction_fn=None,
 ):
+    """
+    Predict a subsample of an image from a bunch of rays, one pixel for each. (default:1024 pixels).\n
+    Build 11D rays (`ro`=3D, `rd`=3D, `near`=1D, `far`=1D, `viewdirs`=3D), and batch them before giving to `predict_and_render_radiance()` for predictions retrieval
+
+    :param int height: of image
+    :param int width: of image
+    :param float focal_length: of cameras
+    :param torch.nn.Module model_coarse:
+    :param None | torch.nn.Module model_fine:
+    :param torch.Tensor ray_origins:
+    :param torch.Tensor ray_directions:
+    :param nerf.cfgnode.CfgNode options: dictionary with all config parameters
+    :param str mode: "train" or "validation"
+    :param None | function encode_position_fn: positional encoding of points positions
+    :param None | function encode_direction_fn: positional encoding of rays view directions
+    :return: rgb_coarse, disp_coarse, acc_coarse, rgb_fine, disp_fine, acc_fine
+    :rtype: tuple[torch.Tensor, torch.Tensor, torch.Tensor, None | torch.Tensor, None | torch.Tensor, None | torch.Tensor]
+    """
+
+    ###############################################################################################################
+    ### Prepare rays ##############################################################################################
     viewdirs = None
     if options.nerf.use_viewdirs:
         # Provide ray directions as input
@@ -166,22 +236,27 @@ def run_one_iter_of_nerf(
     rays = torch.cat((ro, rd, near, far), dim=-1)
     if options.nerf.use_viewdirs:
         rays = torch.cat((rays, viewdirs), dim=-1)
+    ###############################################################################################################
 
-    batches = get_minibatches(rays, chunksize=getattr(options.nerf, mode).chunksize)
+    batches = get_minibatches(rays, chunksize=getattr(options.nerf, mode).chunksize)  # INFO: this is the same function as in "run_network()", why is needed here?
     pred = [
         predict_and_render_radiance(
             batch,
             model_coarse,
             model_fine,
             options,
+            mode,
             encode_position_fn=encode_position_fn,
             encode_direction_fn=encode_direction_fn,
         )
         for batch in batches
     ]
-    synthesized_images = list(zip(*pred))
+    final_preds = list(zip(*pred))
+    radiance_field_penultimate_coarse, radiance_field_penultimate_fine = [f[0] for f in final_preds[-2:]]
+    penultimate_features = radiance_field_penultimate_coarse, radiance_field_penultimate_fine
+    synthesized_images = final_preds[:-2]
     synthesized_images = [
-        torch.cat(image, dim=0) if image[0] is not None else (None)
+        torch.cat(image, dim=0) if image[0] is not None else (None)  # Remove empty elements from the list
         for image in synthesized_images
     ]
     if mode == "validation":
@@ -199,4 +274,4 @@ def run_one_iter_of_nerf(
             # set to None.
             return tuple(synthesized_images + [None, None, None])
 
-    return tuple(synthesized_images)
+    return tuple(synthesized_images), penultimate_features
