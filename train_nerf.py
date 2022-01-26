@@ -2,19 +2,28 @@ import argparse
 import glob
 import os
 import time
+from datetime import timedelta
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
+import wandb
 import yaml
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm, trange
 
+from grownet.grownet import DynamicNet
 from nerf import (CfgNode, get_embedding_function, get_ray_bundle, img2mse,
                   load_blender_data, load_llff_data, meshgrid_xy, models,
                   mse2psnr, run_one_iter_of_nerf)
 
+
+# TODO: improve config (epochs, stages, ...)
+# TODO: implement ensemble checkpointing
+# TODO: improve Wandb logging (mostly ensemble related)
+# TODO: save validation images locally (no Tensorboard)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -39,6 +48,484 @@ def main():
     # torch.autograd.set_detect_anomaly(True)
 
     # If a pre-cached dataset is available, skip the dataloader.
+    hwf, USE_CACHED_DATASET, data_dict = load_data(cfg)  # TODO: maybe to class
+
+    # Seed experiment for repeatability
+    seed = cfg.experiment.randomseed
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    # Device on which to run.
+    if torch.cuda.is_available():
+        device = "cuda"
+    else:
+        device = "cpu"
+
+    encode_position_fn = get_embedding_function(
+        num_encoding_functions=cfg.models.coarse.num_encoding_fn_xyz,
+        include_input=cfg.models.coarse.include_input_xyz,
+        log_sampling=cfg.models.coarse.log_sampling_xyz,
+    )
+
+    encode_direction_fn = None
+    if cfg.models.coarse.use_viewdirs:
+        encode_direction_fn = get_embedding_function(
+            num_encoding_functions=cfg.models.coarse.num_encoding_fn_dir,
+            include_input=cfg.models.coarse.include_input_dir,
+            log_sampling=cfg.models.coarse.log_sampling_dir,
+        )
+
+    # Setup logging.
+    logdir = os.path.join(cfg.experiment.logdir, cfg.experiment.id)
+    os.makedirs(logdir, exist_ok=True)
+    writer = SummaryWriter(logdir)
+    # Write out config parameters.
+    with open(os.path.join(logdir, "config.yml"), "w") as f:
+        f.write(cfg.dump())  # cfg, f, default_flow_style=False)
+
+    wandb_cfg = {
+        "project": "GrowNeRF",
+        "entity": "a-di",
+        "mode": "online",  # ["online", "offline", "disabled"]
+        "tags": ["grownet"],
+        "group": None,  # "exp_1",
+        "job_type": None,
+        "id": None
+    }
+    wandb.init(**wandb_cfg, dir=cfg.experiment.logdir, config=cfg)
+    wandb.config.USE_CACHED_DATASET = USE_CACHED_DATASET
+    if not os.path.isdir(os.path.join(cfg.experiment.logdir, wandb.run.name)):
+        os.mkdir(os.path.join(cfg.experiment.logdir, wandb.run.name))
+
+    # By default, start at iteration 0 (unless a checkpoint is specified).
+    start_iter = 0
+    # Load an existing checkpoint, if a path is specified.
+    # if os.path.exists(configargs.load_checkpoint):
+    #     checkpoint = torch.load(configargs.load_checkpoint)
+    #     model_coarse.load_state_dict(checkpoint["model_coarse_state_dict"])
+    #     if checkpoint["model_fine_state_dict"]:
+    #         model_fine.load_state_dict(checkpoint["model_fine_state_dict"])
+    #     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    #     start_iter = checkpoint["iter"]
+
+    ###################################################################################################################
+    ### ENSEMBLE TRAINING #############################################################################################
+    c0 = torch.Tensor([0.0, 0.0, 0.0, 0.0]).to(device)
+    net_ensemble = DynamicNet(c0, lr=1.0)
+
+    num_nets = 6
+    for stage in range(0, num_nets):
+        weak_model_coarse, weak_model_fine = train_weak(cfg, hwf, USE_CACHED_DATASET, device, writer, data_dict,
+                                                        encode_direction_fn, encode_position_fn,
+                                                        start_iter, net_ensemble, stage)
+        net_ensemble.add(weak_model_coarse)
+
+        if stage > 0:
+            fully_corrective_steps(cfg, hwf, USE_CACHED_DATASET, device, writer, data_dict,
+                                   encode_direction_fn, encode_position_fn,
+                                   start_iter, net_ensemble)
+
+            validate(cfg, hwf, USE_CACHED_DATASET, device, writer, data_dict,
+                     encode_direction_fn, encode_position_fn, stage,
+                     model_coarse=net_ensemble, model_fine=None)
+    ###################################################################################################################
+    print("Done!")
+
+
+def train_weak(cfg, hwf, USE_CACHED_DATASET, device, writer, data_dict, encode_direction_fn, encode_position_fn, start_iter, net_ensemble, stage):
+    # Initialize a coarse-resolution model.
+    model_coarse = getattr(models, cfg.models.coarse.type)(
+        num_layers=cfg.models.coarse.num_layers,
+        hidden_size=cfg.models.coarse.hidden_size,
+        skip_connect_every=cfg.models.coarse.skip_connect_every,
+        num_encoding_fn_xyz=cfg.models.coarse.num_encoding_fn_xyz,
+        num_encoding_fn_dir=cfg.models.coarse.num_encoding_fn_dir,
+        include_input_xyz=cfg.models.coarse.include_input_xyz,
+        include_input_dir=cfg.models.coarse.include_input_dir,
+        use_viewdirs=cfg.models.coarse.use_viewdirs,
+        append_penultimate=stage
+    )
+    model_coarse.to(device)
+
+    # If a fine-resolution model is specified, initialize it.
+    model_fine = None
+    if hasattr(cfg.models, "fine"):
+        model_fine = getattr(models, cfg.models.fine.type)(
+            num_layers=cfg.models.fine.num_layers,
+            hidden_size=cfg.models.fine.hidden_size,
+            skip_connect_every=cfg.models.fine.skip_connect_every,
+            num_encoding_fn_xyz=cfg.models.fine.num_encoding_fn_xyz,
+            num_encoding_fn_dir=cfg.models.fine.num_encoding_fn_dir,
+            include_input_xyz=cfg.models.fine.include_input_xyz,
+            include_input_dir=cfg.models.fine.include_input_dir,
+            use_viewdirs=cfg.models.fine.use_viewdirs,
+            append_penultimate=stage
+        )
+        model_fine.to(device)
+
+    # Initialize optimizer.
+    trainable_parameters = list(model_coarse.parameters())
+    if model_fine is not None:
+        trainable_parameters += list(model_fine.parameters())
+    optimizer = getattr(torch.optim, cfg.optimizer.type)(
+        trainable_parameters, lr=cfg.optimizer.lr
+    )
+
+    # for i in trange(start_iter, cfg.experiment.train_iters):
+    pbar = tqdm(range(1000), desc=f"[{str(timedelta(seconds=time.time() - start))[:-5]}] Stage {stage + 1}/{6}: weak model training", unit=" epoch")
+    for epoch in pbar:
+        model_coarse.train()  # return models to train mode after validation
+        if model_fine:
+            model_coarse.train()
+
+        hwf, ray_directions, ray_origins, target_ray_values = get_random_rays(cfg, hwf, USE_CACHED_DATASET, device, data_dict)
+        grad_direction = target_ray_values
+
+        penultimate_features_coarse, penultimate_features_fine, ray_batches, pts_and_zvals = None, None, None, None
+        if stage > 0:
+            out_ensemble, penultimate_features, ray_batches, pts_and_zvals = run_one_iter_of_nerf(
+                hwf,
+                net_ensemble,
+                None,
+                ray_origins,
+                ray_directions,
+                cfg,
+                "train",
+                encode_position_fn,
+                encode_direction_fn
+            )
+            rgb_coarse_ensemble, _, _, rgb_fine_ensemble, _, _ = out_ensemble  # predictions, one pixel for each ray (default: 1024 pixels)
+            penultimate_features_coarse, penultimate_features_fine = penultimate_features
+            grad_direction = -(rgb_coarse_ensemble - target_ray_values)  # grad_direction = y / (1.0 + torch.exp(y * out))
+
+        out, _, _, _ = run_one_iter_of_nerf(
+            hwf,
+            model_coarse,
+            model_fine,
+            ray_origins,
+            ray_directions,
+            cfg,
+            "train",
+            encode_position_fn,
+            encode_direction_fn,
+            penultimate_features_coarse,
+            penultimate_features_fine,
+            ray_batches,
+            pts_and_zvals,
+        )
+        rgb_coarse, _, _, rgb_fine, _, _ = out  # predictions, one pixel for each ray (default: 1024 pixels)
+
+        # LOSS + UPDATE #
+        coarse_loss = F.mse_loss(
+            rgb_coarse[..., :3], grad_direction[..., :3]
+        )
+        fine_loss = None
+        if rgb_fine is not None:
+            fine_loss = F.mse_loss(
+                rgb_fine[..., :3], grad_direction[..., :3]
+            )
+
+        # coarse_loss = F.mse_loss(
+        #     rgb_coarse[..., :3], target_ray_values[..., :3]
+        # )
+        # fine_loss = None
+        # if rgb_fine is not None:
+        #     fine_loss = F.mse_loss(
+        #         rgb_fine[..., :3], target_ray_values[..., :3]
+        #     )
+
+        loss = coarse_loss + (fine_loss if fine_loss is not None else 0.0)
+        loss.backward()
+        psnr = mse2psnr(loss.item())
+        optimizer.step()
+        optimizer.zero_grad()
+
+        # UPDATE LR #
+        num_decay_steps = cfg.scheduler.lr_decay * 1000
+        lr_new = cfg.optimizer.lr * (
+                cfg.scheduler.lr_decay_factor ** (epoch / num_decay_steps)
+        )
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr_new
+
+        weak_train_log(cfg, epoch + 1, loss, coarse_loss, fine_loss, psnr, writer, pbar)
+
+        # Validation #
+        # if i % cfg.experiment.validate_every == 0 or i == cfg.experiment.train_iters - 1:
+        #     loss, psnr = validate(cfg, H, W, focal, USE_CACHED_DATASET, device, encode_direction_fn, encode_position_fn, i, i_val, images, model_coarse, model_fine, poses, validation_paths, writer)
+
+        # if i % cfg.experiment.save_every == 0 or i == cfg.experiment.train_iters - 1:
+        #     save_checkpoint(i, logdir, loss, model_coarse, model_fine, optimizer, psnr)
+
+    return model_coarse, model_fine
+
+
+def fully_corrective_steps(cfg, hwf, USE_CACHED_DATASET, device, writer, data_dict, encode_direction_fn, encode_position_fn, start_iter, net_ensemble):
+    # Initialize optimizer.
+    optimizer = getattr(torch.optim, cfg.optimizer.type)(
+        net_ensemble.parameters(), lr=cfg.optimizer.lr
+    )
+
+    net_ensemble.to_train()  # return models to train mode after validation
+
+    print("CORRECTIVE STEPS...")
+    for i in trange(0, 1000):
+        hwf, ray_directions, ray_origins, target_ray_values = get_random_rays(cfg, hwf, USE_CACHED_DATASET, device, data_dict)
+
+        out_ensemble, _, _, _ = run_one_iter_of_nerf(
+            hwf,
+            net_ensemble.forward_grad,
+            None,
+            ray_origins,
+            ray_directions,
+            cfg,
+            "train",
+            encode_position_fn,
+            encode_direction_fn,
+            ray_batches=None,
+            pts_and_zvals=None
+        )
+        rgb_coarse_ensemble, _, _, rgb_fine_ensemble, _, _ = out_ensemble  # predictions, one pixel for each ray (default: 1024 pixels)
+
+        coarse_loss = F.mse_loss(
+            rgb_coarse_ensemble[..., :3], target_ray_values[..., :3]
+        )
+        fine_loss = None
+        if rgb_fine_ensemble is not None:
+            fine_loss = F.mse_loss(
+                rgb_fine_ensemble[..., :3], target_ray_values[..., :3]
+            )
+
+        loss = coarse_loss + (fine_loss if fine_loss is not None else 0.0)
+        loss.backward()
+        psnr = mse2psnr(loss.item())
+        optimizer.step()
+        optimizer.zero_grad()
+    print(psnr)
+
+
+def get_random_rays(cfg, hwf, USE_CACHED_DATASET, device, data_dict):
+    """
+    Collect a bunch of random rays (default:1024) with ground truth from a single random image.\n
+    Rays are defined by `ray_origins[]` and `ray_directions[]`.
+
+    :param nerf.cfgnode.CfgNode cfg: dictionary with all config parameters
+    :param int H: image height
+    :param int W: image width
+    :param float focal: cameras focal length
+    :param bool USE_CACHED_DATASET: cache folder must exist for it to have an effect
+    :param str device: usually "cuda" or "cpu"
+    :param None | list[int] i_train: indices of data images used for training, ignored if using cached dataset
+    :param None | torch.Tensor images: loaded dataset [H,W,N,RGB], ignored if using cached dataset
+    :param None | torch.Tensor poses: camera parameters, one camera for each image. Ignored if using cached dataset
+    :param list[str] | None train_paths: one path for each training image, ignored if dataset is not cached
+    :return: H, W, focal, ray_directions, ray_origins, target_ray_values
+    :rtype: tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor]
+    """
+
+    if USE_CACHED_DATASET:
+        datafile = np.random.choice(data_dict["train_paths"])
+        cache_dict = torch.load(datafile)
+        H = cache_dict["height"]
+        W = cache_dict["width"]
+        focal = cache_dict["focal_length"]
+        if not hwf:
+            wandb.config.HWF = [H, W, focal]
+        hwf = H, W, focal
+        ray_bundle = cache_dict["ray_bundle"].to(device)
+        ray_origins, ray_directions = (
+            ray_bundle[0].reshape((-1, 3)),
+            ray_bundle[1].reshape((-1, 3)),
+        )
+        target_ray_values = cache_dict["target"][..., :3].reshape((-1, 3))
+        select_inds = np.random.choice(
+            ray_origins.shape[0],
+            size=(cfg.nerf.train.num_random_rays),
+            replace=False,
+        )
+        ray_origins, ray_directions = (
+            ray_origins[select_inds],
+            ray_directions[select_inds],
+        )
+        target_ray_values = target_ray_values[select_inds].to(device)
+        # ray_bundle = torch.stack([ray_origins, ray_directions], dim=0).to(device)
+    else:
+        H, W, focal = hwf
+        img_idx = np.random.choice(data_dict["i_train"])
+        img_target = data_dict["images"][img_idx].to(device)
+        pose_target = data_dict["poses"][img_idx, :3, :4].to(device)
+        ray_origins, ray_directions = get_ray_bundle(H, W, focal, pose_target)
+        coords = torch.stack(
+            meshgrid_xy(torch.arange(H).to(device), torch.arange(W).to(device)),
+            dim=-1,
+        )
+        coords = coords.reshape((-1, 2))
+        select_inds = np.random.choice(
+            coords.shape[0], size=(cfg.nerf.train.num_random_rays), replace=False
+        )
+        select_inds = coords[select_inds]
+        ray_origins = ray_origins[select_inds[:, 0], select_inds[:, 1], :]
+        ray_directions = ray_directions[select_inds[:, 0], select_inds[:, 1], :]
+        # batch_rays = torch.stack([ray_origins, ray_directions], dim=0)
+        target_s = img_target[select_inds[:, 0], select_inds[:, 1], :]
+        target_ray_values = target_s
+
+    return hwf, ray_directions, ray_origins, target_ray_values
+
+
+def weak_train_log(cfg, epoch, loss, coarse_loss, fine_loss, psnr, writer, pbar):
+    # if i % cfg.experiment.print_every == 0 or i == cfg.experiment.train_iters - 1:
+    #     tqdm.write(
+    #         "[TRAIN] Iter: "
+    #         + str(i)
+    #         + " Loss: "
+    #         + str(loss.item())
+    #         + " PSNR: "
+    #         + str(psnr)
+    #     )
+
+    if epoch % cfg.experiment.print_every == 0 or epoch == cfg.experiment.train_iters - 1:
+        pbar.set_postfix({
+            'loss': loss.item(),
+            'loss_coarse': coarse_loss.item(),
+            # 'lr': lr,
+            # 'n_params': _n_params,
+            'psnr': psnr
+        })
+
+        if fine_loss is not None:
+            pbar.set_postfix({
+                'loss_fine': fine_loss.item(),
+            })
+
+            wandb.log({
+                "Weak/train/loss_fine": fine_loss.item(),
+            }, commit=False)
+
+        wandb.log({
+            "epoch": epoch,
+            # "stage": stage,
+            # "Weak/lr": lr,
+            "Weak/train/loss": loss.item(),
+            "Weak/train/loss_coarse": coarse_loss.item(),
+            "Weak/train/psnr": psnr,
+        }, commit=True)
+
+        # writer.add_scalar("train/loss", loss.item(), epoch)
+        # writer.add_scalar("train/coarse_loss", coarse_loss.item(), epoch)
+        # if fine_loss is not None:
+        #     writer.add_scalar("train/fine_loss", fine_loss.item(), epoch)
+        # writer.add_scalar("train/psnr", psnr, epoch)
+
+
+def save_checkpoint(i, logdir, loss, model_coarse, model_fine, optimizer, psnr):
+    checkpoint_dict = {
+        "iter": i,
+        "model_coarse_state_dict": model_coarse.state_dict(),
+        "model_fine_state_dict": None
+        if not model_fine
+        else model_fine.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "loss": loss,
+        "psnr": psnr,
+    }
+    torch.save(
+        checkpoint_dict,
+        os.path.join(logdir, "checkpoint" + str(i).zfill(5) + ".ckpt"),
+    )
+    tqdm.write("================== Saved Checkpoint =================")
+
+
+def validate(cfg, hwf, USE_CACHED_DATASET, device, writer, data_dict, encode_direction_fn, encode_position_fn, i, model_coarse, model_fine):
+    # tqdm.write("[VAL] =======> Iter: " + str(i))
+    # model_coarse.eval()
+    # if model_fine:
+    #     model_coarse.eval()
+    model_coarse.to_eval()
+    if model_fine:
+        model_coarse.to_eval()
+
+    start = time.time()
+    with torch.no_grad():
+        if USE_CACHED_DATASET:
+            datafile = np.random.choice(data_dict["validation_paths"])
+            cache_dict = torch.load(datafile)
+            H = cache_dict["height"]
+            W = cache_dict["width"]
+            focal = cache_dict["focal_length"]
+            hwf = H, W, focal
+            ray_origins = cache_dict["ray_origins"].to(device)
+            ray_directions = cache_dict["ray_directions"].to(device)
+            target_ray_values = cache_dict["target"].to(device)
+        else:
+            img_idx = np.random.choice(data_dict["i_val"])
+            img_target = data_dict["images"][img_idx].to(device)
+            target_ray_values = img_target
+            pose_target = data_dict["poses"][img_idx, :3, :4].to(device)
+            ray_origins, ray_directions = get_ray_bundle(*hwf, pose_target)
+
+        rgb_coarse, _, _, rgb_fine, _, _ = run_one_iter_of_nerf(
+            hwf,
+            model_coarse,
+            model_fine,
+            ray_origins,
+            ray_directions,
+            cfg,
+            mode="validation",
+            encode_position_fn=encode_position_fn,
+            encode_direction_fn=encode_direction_fn,
+        )
+
+        coarse_loss = img2mse(rgb_coarse[..., :3], target_ray_values[..., :3])
+        loss, fine_loss = 0.0, 0.0
+        if rgb_fine is not None:
+            fine_loss = img2mse(rgb_fine[..., :3], target_ray_values[..., :3])
+        loss = coarse_loss + fine_loss
+        psnr = mse2psnr(loss.item())
+
+        if fine_loss is not None:
+            wandb.log({
+                "Ensemble/validation/loss_fine": fine_loss,
+            }, commit=False)
+
+        wandb.log({
+            "stage": i,
+            "Ensemble/validation/loss": loss.item(),
+            "Ensemble/validation/loss_coarse": coarse_loss.item(),
+            "Ensemble/validation/psnr": psnr,
+        }, commit=True)
+
+        cv2.imwrite(f'{cfg.experiment.logdir}/{wandb.run.name}/_ensVal_rgb_coarse{i}.png', cv2.cvtColor(rgb_coarse[..., :3].detach().cpu().numpy() * 255, cv2.COLOR_BGR2RGB))
+        cv2.imwrite(f'{cfg.experiment.logdir}/{wandb.run.name}/_ensVal_target_rgb_coarse{i}.png', cv2.cvtColor(target_ray_values[..., :3].detach().cpu().numpy() * 255, cv2.COLOR_BGR2RGB))
+
+        writer.add_scalar("validation/loss", loss.item(), i)
+        writer.add_scalar("validation/coarse_loss", coarse_loss.item(), i)
+        writer.add_scalar("validation/psnr", psnr, i)
+        writer.add_image(
+            "validation/rgb_coarse", cast_to_image(rgb_coarse[..., :3]), i
+        )
+        if rgb_fine is not None:
+            writer.add_image(
+                "validation/rgb_fine", cast_to_image(rgb_fine[..., :3]), i
+            )
+            writer.add_scalar("validation/fine_loss", fine_loss.item(), i)
+        writer.add_image(
+            "validation/img_target",
+            cast_to_image(target_ray_values[..., :3]),
+            i,
+        )
+
+        tqdm.write(
+            "Validation loss: "
+            + str(loss.item())
+            + " Validation PSNR: "
+            + str(psnr)
+            + " Time: "
+            + str(time.time() - start)
+        )
+
+
+def load_data(cfg):
     USE_CACHED_DATASET = False
     train_paths, validation_paths = None, None
     images, poses, render_poses, hwf, i_split = None, None, None, None, None
@@ -90,315 +577,16 @@ def main():
             images = torch.from_numpy(images)
             poses = torch.from_numpy(poses)
 
-    # Seed experiment for repeatability
-    seed = cfg.experiment.randomseed
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-    # Device on which to run.
-    if torch.cuda.is_available():
-        device = "cuda"
-    else:
-        device = "cpu"
-
-    encode_position_fn = get_embedding_function(
-        num_encoding_functions=cfg.models.coarse.num_encoding_fn_xyz,
-        include_input=cfg.models.coarse.include_input_xyz,
-        log_sampling=cfg.models.coarse.log_sampling_xyz,
-    )
-
-    encode_direction_fn = None
-    if cfg.models.coarse.use_viewdirs:
-        encode_direction_fn = get_embedding_function(
-            num_encoding_functions=cfg.models.coarse.num_encoding_fn_dir,
-            include_input=cfg.models.coarse.include_input_dir,
-            log_sampling=cfg.models.coarse.log_sampling_dir,
-        )
-
-    # Initialize a coarse-resolution model.
-    model_coarse = getattr(models, cfg.models.coarse.type)(
-        num_encoding_fn_xyz=cfg.models.coarse.num_encoding_fn_xyz,
-        num_encoding_fn_dir=cfg.models.coarse.num_encoding_fn_dir,
-        include_input_xyz=cfg.models.coarse.include_input_xyz,
-        include_input_dir=cfg.models.coarse.include_input_dir,
-        use_viewdirs=cfg.models.coarse.use_viewdirs,
-    )
-    model_coarse.to(device)
-    # If a fine-resolution model is specified, initialize it.
-    model_fine = None
-    if hasattr(cfg.models, "fine"):
-        model_fine = getattr(models, cfg.models.fine.type)(
-            num_encoding_fn_xyz=cfg.models.fine.num_encoding_fn_xyz,
-            num_encoding_fn_dir=cfg.models.fine.num_encoding_fn_dir,
-            include_input_xyz=cfg.models.fine.include_input_xyz,
-            include_input_dir=cfg.models.fine.include_input_dir,
-            use_viewdirs=cfg.models.fine.use_viewdirs,
-        )
-        model_fine.to(device)
-
-    # Initialize optimizer.
-    trainable_parameters = list(model_coarse.parameters())
-    if model_fine is not None:
-        trainable_parameters += list(model_fine.parameters())
-    optimizer = getattr(torch.optim, cfg.optimizer.type)(
-        trainable_parameters, lr=cfg.optimizer.lr
-    )
-
-    # Setup logging.
-    logdir = os.path.join(cfg.experiment.logdir, cfg.experiment.id)
-    os.makedirs(logdir, exist_ok=True)
-    writer = SummaryWriter(logdir)
-    # Write out config parameters.
-    with open(os.path.join(logdir, "config.yml"), "w") as f:
-        f.write(cfg.dump())  # cfg, f, default_flow_style=False)
-
-    # By default, start at iteration 0 (unless a checkpoint is specified).
-    start_iter = 0
-
-    # Load an existing checkpoint, if a path is specified.
-    if os.path.exists(configargs.load_checkpoint):
-        checkpoint = torch.load(configargs.load_checkpoint)
-        model_coarse.load_state_dict(checkpoint["model_coarse_state_dict"])
-        if checkpoint["model_fine_state_dict"]:
-            model_fine.load_state_dict(checkpoint["model_fine_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        start_iter = checkpoint["iter"]
-
-    # # TODO: Prepare raybatch tensor if batching random rays
-
-    ## TRAIN LOOP ##
-    for i in trange(start_iter, cfg.experiment.train_iters):
-
-        # return models to train mode after validation
-        model_coarse.train()
-        if model_fine:
-            model_coarse.train()
-
-        H, W, focal, ray_directions, ray_origins, target_ray_values = get_random_rays(cfg, H, W, focal, USE_CACHED_DATASET, device, i_train, images, poses, train_paths)
-
-        out, penultimate_features = run_one_iter_of_nerf(
-            H,
-            W,
-            focal,
-            model_coarse,
-            model_fine,
-            ray_origins,
-            ray_directions,
-            cfg,
-            mode="train",
-            encode_position_fn=encode_position_fn,
-            encode_direction_fn=encode_direction_fn,
-        )
-        rgb_coarse, _, _, rgb_fine, _, _ = out  # predictions, one pixel for each ray (default: 1024 pixels)
-        radiance_field_penultimate_coarse, radiance_field_penultimate_fine = penultimate_features
-
-        # LOSS + UPDATE #
-        coarse_loss = F.mse_loss(
-            rgb_coarse[..., :3], target_ray_values[..., :3]
-        )
-        fine_loss = None
-        if rgb_fine is not None:
-            fine_loss = F.mse_loss(
-                rgb_fine[..., :3], target_ray_values[..., :3]
-            )
-        loss = coarse_loss + (fine_loss if fine_loss is not None else 0.0)
-        loss.backward()
-        psnr = mse2psnr(loss.item())
-        optimizer.step()
-        optimizer.zero_grad()
-
-        # UPDATE LR #
-        num_decay_steps = cfg.scheduler.lr_decay * 1000
-        lr_new = cfg.optimizer.lr * (
-                cfg.scheduler.lr_decay_factor ** (i / num_decay_steps)
-        )
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr_new
-
-        train_log(cfg, coarse_loss, fine_loss, i, loss, psnr, rgb_fine, writer)
-
-        # Validation #
-        if i % cfg.experiment.validate_every == 0 or i == cfg.experiment.train_iters - 1:
-            loss, psnr = validate(cfg, H, W, focal, USE_CACHED_DATASET, device, encode_direction_fn, encode_position_fn, i, i_val, images, model_coarse, model_fine, poses, validation_paths, writer)
-
-        if i % cfg.experiment.save_every == 0 or i == cfg.experiment.train_iters - 1:
-            save_checkpoint(i, logdir, loss, model_coarse, model_fine, optimizer, psnr)
-
-    print("Done!")
-
-
-def get_random_rays(cfg, H, W, focal, USE_CACHED_DATASET, device, i_train, images, poses, train_paths):
-    """
-    Collect a bunch of random rays (default:1024) with ground truth from a single random image.\n
-    Rays are defined by `ray_origins[]` and `ray_directions[]`.
-
-    :param nerf.cfgnode.CfgNode cfg: dictionary with all config parameters
-    :param int H: image height
-    :param int W: image width
-    :param float focal: cameras focal length
-    :param bool USE_CACHED_DATASET: cache folder must exist for it to have an effect
-    :param str device: usually "cuda" or "cpu"
-    :param None | list[int] i_train: indices of data images used for training, ignored if using cached dataset
-    :param None | torch.Tensor images: loaded dataset [H,W,N,RGB], ignored if using cached dataset
-    :param None | torch.Tensor poses: camera parameters, one camera for each image. Ignored if using cached dataset
-    :param list[str] | None train_paths: one path for each training image, ignored if dataset is not cached
-    :return: H, W, focal, ray_directions, ray_origins, target_ray_values
-    :rtype: tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor]
-    """
-
-    if USE_CACHED_DATASET:
-        datafile = np.random.choice(train_paths)
-        cache_dict = torch.load(datafile)
-        H = cache_dict["height"]
-        W = cache_dict["width"]
-        focal = cache_dict["focal_length"]
-        ray_bundle = cache_dict["ray_bundle"].to(device)
-        ray_origins, ray_directions = (
-            ray_bundle[0].reshape((-1, 3)),
-            ray_bundle[1].reshape((-1, 3)),
-        )
-        target_ray_values = cache_dict["target"][..., :3].reshape((-1, 3))
-        select_inds = np.random.choice(
-            ray_origins.shape[0],
-            size=(cfg.nerf.train.num_random_rays),
-            replace=False,
-        )
-        ray_origins, ray_directions = (
-            ray_origins[select_inds],
-            ray_directions[select_inds],
-        )
-        target_ray_values = target_ray_values[select_inds].to(device)
-        # ray_bundle = torch.stack([ray_origins, ray_directions], dim=0).to(device)
-    else:
-        img_idx = np.random.choice(i_train)
-        img_target = images[img_idx].to(device)
-        pose_target = poses[img_idx, :3, :4].to(device)
-        ray_origins, ray_directions = get_ray_bundle(H, W, focal, pose_target)
-        coords = torch.stack(
-            meshgrid_xy(torch.arange(H).to(device), torch.arange(W).to(device)),
-            dim=-1,
-        )
-        coords = coords.reshape((-1, 2))
-        select_inds = np.random.choice(
-            coords.shape[0], size=(cfg.nerf.train.num_random_rays), replace=False
-        )
-        select_inds = coords[select_inds]
-        ray_origins = ray_origins[select_inds[:, 0], select_inds[:, 1], :]
-        ray_directions = ray_directions[select_inds[:, 0], select_inds[:, 1], :]
-        # batch_rays = torch.stack([ray_origins, ray_directions], dim=0)
-        target_s = img_target[select_inds[:, 0], select_inds[:, 1], :]
-        target_ray_values = target_s
-
-    return H, W, focal, ray_directions, ray_origins, target_ray_values
-
-
-def train_log(cfg, coarse_loss, fine_loss, i, loss, psnr, rgb_fine, writer):
-    if i % cfg.experiment.print_every == 0 or i == cfg.experiment.train_iters - 1:
-        tqdm.write(
-            "[TRAIN] Iter: "
-            + str(i)
-            + " Loss: "
-            + str(loss.item())
-            + " PSNR: "
-            + str(psnr)
-        )
-    writer.add_scalar("train/loss", loss.item(), i)
-    writer.add_scalar("train/coarse_loss", coarse_loss.item(), i)
-    if rgb_fine is not None:
-        writer.add_scalar("train/fine_loss", fine_loss.item(), i)
-    writer.add_scalar("train/psnr", psnr, i)
-
-
-def save_checkpoint(i, logdir, loss, model_coarse, model_fine, optimizer, psnr):
-    checkpoint_dict = {
-        "iter": i,
-        "model_coarse_state_dict": model_coarse.state_dict(),
-        "model_fine_state_dict": None
-        if not model_fine
-        else model_fine.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "loss": loss,
-        "psnr": psnr,
+    data_dict = {
+        "i_train": i_train,
+        "i_val": i_val,
+        "images": images,
+        "poses": poses,
+        "train_paths": train_paths,
+        "validation_paths": validation_paths
     }
-    torch.save(
-        checkpoint_dict,
-        os.path.join(logdir, "checkpoint" + str(i).zfill(5) + ".ckpt"),
-    )
-    tqdm.write("================== Saved Checkpoint =================")
 
-
-def validate(cfg, H, W, focal, USE_CACHED_DATASET, device, encode_direction_fn, encode_position_fn, i, i_val, images, model_coarse, model_fine, poses, validation_paths, writer):
-    tqdm.write("[VAL] =======> Iter: " + str(i))
-    model_coarse.eval()
-    if model_fine:
-        model_coarse.eval()
-    start = time.time()
-    with torch.no_grad():
-        rgb_coarse, rgb_fine = None, None
-        target_ray_values = None
-        if USE_CACHED_DATASET:
-            datafile = np.random.choice(validation_paths)
-            cache_dict = torch.load(datafile)
-            H = cache_dict["height"]
-            W = cache_dict["width"]
-            focal = cache_dict["focal_length"]
-            ray_origins = cache_dict["ray_origins"].to(device)
-            ray_directions = cache_dict["ray_directions"].to(device)
-            target_ray_values = cache_dict["target"].to(device)
-        else:
-            img_idx = np.random.choice(i_val)
-            img_target = images[img_idx].to(device)
-            target_ray_values = img_target
-            pose_target = poses[img_idx, :3, :4].to(device)
-            ray_origins, ray_directions = get_ray_bundle(H, W, focal, pose_target)
-
-        rgb_coarse, _, _, rgb_fine, _, _ = run_one_iter_of_nerf(
-            H,
-            W,
-            focal,
-            model_coarse,
-            model_fine,
-            ray_origins,
-            ray_directions,
-            cfg,
-            mode="validation",
-            encode_position_fn=encode_position_fn,
-            encode_direction_fn=encode_direction_fn,
-        )
-
-        coarse_loss = img2mse(rgb_coarse[..., :3], target_ray_values[..., :3])
-        loss, fine_loss = 0.0, 0.0
-        if rgb_fine is not None:
-            fine_loss = img2mse(rgb_fine[..., :3], target_ray_values[..., :3])
-        loss = coarse_loss + fine_loss
-        psnr = mse2psnr(loss.item())
-
-        writer.add_scalar("validation/loss", loss.item(), i)
-        writer.add_scalar("validation/coarse_loss", coarse_loss.item(), i)
-        writer.add_scalar("validation/psnr", psnr, i)
-        writer.add_image(
-            "validation/rgb_coarse", cast_to_image(rgb_coarse[..., :3]), i
-        )
-        if rgb_fine is not None:
-            writer.add_image(
-                "validation/rgb_fine", cast_to_image(rgb_fine[..., :3]), i
-            )
-            writer.add_scalar("validation/fine_loss", fine_loss.item(), i)
-        writer.add_image(
-            "validation/img_target",
-            cast_to_image(target_ray_values[..., :3]),
-            i,
-        )
-
-        tqdm.write(
-            "Validation loss: "
-            + str(loss.item())
-            + " Validation PSNR: "
-            + str(psnr)
-            + " Time: "
-            + str(time.time() - start)
-        )
-    return loss, psnr
+    return hwf, USE_CACHED_DATASET, data_dict
 
 
 def cast_to_image(tensor):
@@ -412,4 +600,6 @@ def cast_to_image(tensor):
 
 
 if __name__ == "__main__":
+    start = time.time()
     main()
+    print("seconds: ", time.time() - start)

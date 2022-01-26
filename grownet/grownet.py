@@ -78,7 +78,7 @@ class DynamicNet:
                 else:
                     middle_feat_cum, pred = m(x, middle_feat_cum)
                     prediction += pred
-        return middle_feat_cum, self.c0 + self.boost_rate * prediction  # TODO: check if these parameters are necessary
+        return middle_feat_cum, self.c0 + self.boost_rate * prediction
 
     def forward_grad(self, x):
         if len(self.models) == 0:
@@ -93,8 +93,8 @@ class DynamicNet:
         return middle_feat_cum, self.c0 + self.boost_rate * prediction
 
     def __call__(self, x):
-        _, out = self.forward_grad(x)
-        return out
+        penultimate, out = self.forward(x)
+        return penultimate, out
 
     @classmethod
     def from_file(cls, path, builder):

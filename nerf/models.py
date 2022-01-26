@@ -193,22 +193,24 @@ class FlexibleNeRFModel(torch.nn.Module):
             include_input_xyz=True,
             include_input_dir=True,
             use_viewdirs=True,
-            append_penultimate=None,
+            append_penultimate=False,
     ):
         super(FlexibleNeRFModel, self).__init__()
 
         include_input_xyz = 3 if include_input_xyz else 0
         include_input_dir = 3 if include_input_dir else 0
         self.dim_xyz = include_input_xyz + 2 * 3 * num_encoding_fn_xyz
-        if append_penultimate:
-            self.dim_xyz += append_penultimate
 
         self.dim_dir = include_input_dir + 2 * 3 * num_encoding_fn_dir
         self.skip_connect_every = skip_connect_every
         if not use_viewdirs:
             self.dim_dir = 0
 
-        self.layer1 = torch.nn.Linear(self.dim_xyz, hidden_size)
+        input_xyz = self.dim_xyz
+        if append_penultimate:
+            input_xyz = self.dim_xyz + hidden_size
+
+        self.layer1 = torch.nn.Linear(input_xyz, hidden_size)
         self.layers_xyz = torch.nn.ModuleList()
         for i in range(num_layers - 1):
             if i % self.skip_connect_every == 0 and i > 0 and i != num_layers - 1:
@@ -235,20 +237,17 @@ class FlexibleNeRFModel(torch.nn.Module):
         self.relu = torch.nn.functional.relu
 
     def forward(self, x, prev_penultimate=None):
-        if prev_penultimate:
-            x = torch.cat([x, prev_penultimate], dim=1)
-
         if self.use_viewdirs:
             xyz, view = x[..., : self.dim_xyz], x[..., self.dim_xyz:]
         else:
             xyz = x[..., : self.dim_xyz]
+
+        if prev_penultimate is not None:
+            xyz = torch.cat([xyz, prev_penultimate], dim=1)
+
         x = self.layer1(xyz)
         for i in range(len(self.layers_xyz)):
-            if (
-                    i % self.skip_connect_every == 0
-                    and i > 0
-                    and i != len(self.linear_layers) - 1
-            ):
+            if i % self.skip_connect_every == 0 and i > 0 and i != len(self.layers_xyz):
                 x = torch.cat((x, xyz), dim=-1)
             x = self.relu(self.layers_xyz[i](x))
         penultimate_xyz = x
