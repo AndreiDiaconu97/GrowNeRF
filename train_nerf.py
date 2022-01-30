@@ -1,6 +1,4 @@
 import argparse
-import glob
-import itertools
 import os
 import time
 from datetime import timedelta
@@ -10,32 +8,28 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torchvision
 import wandb
 import yaml
-from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm, trange
+from tqdm import tqdm
 
 from grownet.grownet import DynamicNet
-from nerf import (CfgNode, get_embedding_function, get_ray_bundle, img2mse,
-                  load_blender_data, load_llff_data, meshgrid_xy, models,
-                  mse2psnr, run_one_iter_of_nerf)
+from nerf import (CfgNode, get_embedding_function, get_ray_bundle, img2mse, mse2psnr, run_one_iter_of_nerf)
+from train_nerf_utils import load_checkpoint, get_img_grid, save_checkpoint, load_data, get_random_rays, get_model_coarse, get_model_fine
 
-
-# TODO: improve config (epochs, stages, ...)
-# TODO: implement ensemble checkpointing
-# TODO: improve Wandb logging (n_params, ...)
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--config", type=str, required=True, help="Path to (.yml) config file."
     )
-    parser.add_argument(
+    parser.add_argument(  # loading checkpoint ignores config argument
         "--load-checkpoint",
         type=str,
         default="",
-        help="Path to load saved checkpoint from.",
+        help="Path to load saved checkpoint from. Creates separate run",
+    )
+    parser.add_argument(
+        "--resume", action="store_true", help="Resume from last checkpoint. (On wandb too)"
     )
     configargs = parser.parse_args()
 
@@ -62,6 +56,9 @@ def main():
     else:
         device = "cpu"
 
+    ###################################################################################################################
+    ### POSITIONAL ENCODINGS used in run_network() ####################################################################
+
     encode_position_fn = get_embedding_function(
         num_encoding_functions=cfg.models.coarse.num_encoding_fn_xyz,
         include_input=cfg.models.coarse.include_input_xyz,
@@ -76,13 +73,35 @@ def main():
             log_sampling=cfg.models.coarse.log_sampling_dir,
         )
 
+    ###################################################################################################################
+    ### INIT + LOAD CHECKPOINT ########################################################################################
+
+    # By default, start at iteration 0 (unless a checkpoint is specified).
+    start_stage, start_weak_epoch = 0, 0
+    weak_model_coarse, weak_model_fine = None, None
+    net_ensemble_coarse = DynamicNet(torch.Tensor([0.0, 0.0, 0.0, 0.0]).to(device), cfg.experiment.boost_rate, device)
+    net_ensemble_fine = DynamicNet(torch.Tensor([0.0, 0.0, 0.0, 0.0]).to(device), cfg.experiment.boost_rate, device)
+
+    run_id = None
+    resume = False
+    if os.path.exists(configargs.load_checkpoint):  # Load an existing checkpoint, if a path is specified
+        cfg_loaded, run_id, start_stage, start_weak_epoch, weak_model_coarse, weak_model_fine = load_checkpoint(configargs, device, net_ensemble_coarse, net_ensemble_fine)
+        cfg = cfg_loaded
+        if configargs.resume:  # if resume is given, run is continued from selected checkpoint. A separate run is done otherwise
+            resume = "must"
+        else:
+            run_id = None
+
     # Setup tensorboard logging. # OLD
     # logdir = os.path.join(cfg.experiment.logdir, cfg.experiment.id)
     # os.makedirs(logdir, exist_ok=True)
     # writer = SummaryWriter(logdir)
     # # Write out config parameters.
     # with open(os.path.join(logdir, "config.yml"), "w") as f:
-    #     f.write(cfg.dump())  # cfg, f, default_flow_style=False)
+    #     f.write(cfg.dump())  # cfg, f, default_flow_style=False
+
+    ###################################################################################################################
+    ### LOGGING INIT ##################################################################################################
 
     wandb_cfg = {
         "project": "GrowNeRF",
@@ -91,72 +110,45 @@ def main():
         "tags": ["grownet"],
         "group": None,  # "exp_1",
         "job_type": None,
-        "id": None
+        "id": run_id,
+        "resume": resume
     }
     wandb.init(**wandb_cfg, dir=cfg.experiment.logdir, config=cfg)
     wandb.config.USE_CACHED_DATASET = USE_CACHED_DATASET
     if not os.path.isdir(os.path.join(cfg.experiment.logdir, wandb.run.name)):
         os.mkdir(os.path.join(cfg.experiment.logdir, wandb.run.name))
 
-    # By default, start at iteration 0 (unless a checkpoint is specified).
-    start_iter = 0
-    # Load an existing checkpoint, if a path is specified.
-    # if os.path.exists(configargs.load_checkpoint):
-    #     checkpoint = torch.load(configargs.load_checkpoint)
-    #     model_coarse.load_state_dict(checkpoint["model_coarse_state_dict"])
-    #     if checkpoint["model_fine_state_dict"]:
-    #         model_fine.load_state_dict(checkpoint["model_fine_state_dict"])
-    #     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    #     start_iter = checkpoint["iter"]
-
     ###################################################################################################################
     ### ENSEMBLE TRAINING #############################################################################################
-    net_ensemble_coarse = DynamicNet(c0=torch.Tensor([0.0, 0.0, 0.0, 0.0]).to(device), lr=cfg.experiment.boost_rate)
-    net_ensemble_fine = DynamicNet(c0=torch.Tensor([0.0, 0.0, 0.0, 0.0]).to(device), lr=cfg.experiment.boost_rate)
 
-    for stage in range(cfg.experiment.n_stages):
-        weak_model_coarse, weak_model_fine = train_weak(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_fn, encode_position_fn, start_iter, net_ensemble_coarse, net_ensemble_fine,
-                                                        stage)
+    for stage in range(start_stage, cfg.experiment.n_stages):
+        if stage == start_stage:  # check checkpoint loaded only at first iteration
+            weak_model_coarse, weak_model_fine = train_weak(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_fn, encode_position_fn, start_weak_epoch, net_ensemble_coarse,
+                                                            net_ensemble_fine, stage, weak_model_coarse, weak_model_fine)
+        else:
+            weak_model_coarse, weak_model_fine = train_weak(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_fn, encode_position_fn, 0, net_ensemble_coarse,
+                                                            net_ensemble_fine, stage)
         net_ensemble_coarse.add(weak_model_coarse)
         net_ensemble_fine.add(weak_model_fine)
 
         if stage > 0:
-            fully_corrective_steps(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_fn, encode_position_fn, start_iter, net_ensemble_coarse, net_ensemble_fine, stage)
+            fully_corrective_steps(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_fn, encode_position_fn, net_ensemble_coarse, net_ensemble_fine, stage)
 
         validate(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_fn, encode_position_fn, stage, net_ensemble_coarse, net_ensemble_fine)
     ###################################################################################################################
-    print("Done!")
+    print("- DONE -")
 
 
-def train_weak(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_fn, encode_position_fn, start_iter, net_ensemble_coarse, net_ensemble_fine, stage):
-    # Initialize a coarse-resolution model.
-    model_coarse = getattr(models, cfg.models.coarse.type)(
-        num_layers=cfg.models.coarse.num_layers,
-        hidden_size=cfg.models.coarse.hidden_size,
-        skip_connect_every=cfg.models.coarse.skip_connect_every,
-        num_encoding_fn_xyz=cfg.models.coarse.num_encoding_fn_xyz,
-        num_encoding_fn_dir=cfg.models.coarse.num_encoding_fn_dir,
-        include_input_xyz=cfg.models.coarse.include_input_xyz,
-        include_input_dir=cfg.models.coarse.include_input_dir,
-        use_viewdirs=cfg.models.coarse.use_viewdirs,
-        append_penultimate=stage
-    )
-    model_coarse.to(device)
-
-    # If a fine-resolution model is specified, initialize it.
-    model_fine = None
-    if hasattr(cfg.models, "fine"):
-        model_fine = getattr(models, cfg.models.fine.type)(
-            num_layers=cfg.models.fine.num_layers,
-            hidden_size=cfg.models.fine.hidden_size,
-            skip_connect_every=cfg.models.fine.skip_connect_every,
-            num_encoding_fn_xyz=cfg.models.fine.num_encoding_fn_xyz,
-            num_encoding_fn_dir=cfg.models.fine.num_encoding_fn_dir,
-            include_input_xyz=cfg.models.fine.include_input_xyz,
-            include_input_dir=cfg.models.fine.include_input_dir,
-            use_viewdirs=cfg.models.fine.use_viewdirs,
-            append_penultimate=stage
-        )
+def train_weak(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_fn, encode_position_fn,
+               start_epoch, net_ensemble_coarse, net_ensemble_fine, stage, weak_model_coarse=None, weak_model_fine=None):
+    if weak_model_coarse:
+        model_coarse = weak_model_coarse
+        model_fine = weak_model_fine  # no problem if is None
+    else:  # if no existent coarse, create both coarse and fine models
+        model_coarse = get_model_coarse(cfg, stage)
+        model_coarse.to(device)
+        model_fine = get_model_fine(cfg, stage)
+    if model_fine:
         model_fine.to(device)
 
     # Initialize optimizer.
@@ -172,7 +164,8 @@ def train_weak(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction
         net_ensemble_fine.to_train()
 
     # for i in trange(start_iter, cfg.experiment.weak_train_iters):
-    pbar = tqdm(range(cfg.experiment.weak_train_iters), desc=f"[{str(timedelta(seconds=time.time() - start))[:-5]}] Stage {stage + 1}/{cfg.experiment.n_stages}: weak model training", unit=" epoch")
+    pbar = tqdm(range(start_epoch, cfg.experiment.weak_train_iters), desc=f"[{str(timedelta(seconds=time.time() - start))[:-5]}] Stage {stage + 1}/{cfg.experiment.n_stages}: weak model training",
+                unit=" epoch")
     for epoch in pbar:
         model_coarse.train()  # return models to train mode after validation
         if model_fine:
@@ -247,13 +240,14 @@ def train_weak(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction
         # if i % cfg.experiment.validate_every == 0 or i == cfg.experiment.weak_train_iters - 1:
         #     loss, psnr = validate(cfg, H, W, focal, USE_CACHED_DATASET, device, encode_direction_fn, encode_position_fn, i, i_val, images, model_coarse, model_fine, poses, validation_paths, writer)
 
-        # if i % cfg.experiment.save_every == 0 or i == cfg.experiment.weak_train_iters - 1:
-        #     save_checkpoint(i, logdir, loss, model_coarse, model_fine, optimizer, psnr)
+        # SAVE CHECKPOINT #
+        if epoch % cfg.experiment.save_every == 0 or epoch == cfg.experiment.weak_train_iters - 1:
+            save_checkpoint(cfg, stage, epoch, loss, model_coarse, model_fine, net_ensemble_coarse, net_ensemble_fine, optimizer, psnr)
 
     return model_coarse, model_fine
 
 
-def fully_corrective_steps(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_fn, encode_position_fn, start_iter, net_ensemble_coarse, net_ensemble_fine, stage):
+def fully_corrective_steps(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_fn, encode_position_fn, net_ensemble_coarse, net_ensemble_fine, stage):
     # Initialize optimizer.
     trainable_parameters = list(net_ensemble_coarse.parameters())
     if net_ensemble_fine is not None:
@@ -312,74 +306,6 @@ def fully_corrective_steps(cfg, hwf, USE_CACHED_DATASET, device, data_dict, enco
         )
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr_new
-
-
-def get_random_rays(cfg, hwf, USE_CACHED_DATASET, device, data_dict):
-    """
-    Collect a bunch of random rays (default:1024) with ground truth from a single random image.\n
-    Rays are defined by `ray_origins[]` and `ray_directions[]`.
-
-    :param nerf.cfgnode.CfgNode cfg: dictionary with all config parameters
-    :param list[int,int,float] hwf: list containing image height, width, and cameras focal length
-    :param bool USE_CACHED_DATASET: cache folder must exist for it to have an effect
-    :param str device: usually "cuda" or "cpu"
-    :param data_dict: contains i_train, images, poses and train_paths
-        - None | list[int] i_train: indices of data images used for training, ignored if using cached dataset
-        - None | torch.Tensor images: loaded dataset [H,W,N,RGB], ignored if using cached dataset
-        - None | torch.Tensor poses: camera parameters, one camera for each image. Ignored if using cached dataset
-        - list[str] | None train_paths: one path for each training image, ignored if dataset is not cached
-    :return: hwf, ray_directions, ray_origins, target_ray_values
-    :rtype: tuple[ list[int,int,float], torch.Tensor, torch.Tensor, torch.Tensor]
-    """
-
-    if USE_CACHED_DATASET:
-        datafile = np.random.choice(data_dict["train_paths"])
-        cache_dict = torch.load(datafile)
-        H = cache_dict["height"]
-        W = cache_dict["width"]
-        focal = cache_dict["focal_length"]
-        if not hwf:
-            wandb.config.HWF = [H, W, focal]
-        hwf = H, W, focal
-        ray_bundle = cache_dict["ray_bundle"].to(device)
-        ray_origins, ray_directions = (
-            ray_bundle[0].reshape((-1, 3)),
-            ray_bundle[1].reshape((-1, 3)),
-        )
-        target_ray_values = cache_dict["target"][..., :3].reshape((-1, 3))
-        select_inds = np.random.choice(
-            ray_origins.shape[0],
-            size=(cfg.nerf.train.num_random_rays),
-            replace=False,
-        )
-        ray_origins, ray_directions = (
-            ray_origins[select_inds],
-            ray_directions[select_inds],
-        )
-        target_ray_values = target_ray_values[select_inds].to(device)
-        # ray_bundle = torch.stack([ray_origins, ray_directions], dim=0).to(device)
-    else:
-        H, W, focal = hwf
-        img_idx = np.random.choice(data_dict["i_train"])
-        img_target = data_dict["images"][img_idx].to(device)
-        pose_target = data_dict["poses"][img_idx, :3, :4].to(device)
-        ray_origins, ray_directions = get_ray_bundle(H, W, focal, pose_target)
-        coords = torch.stack(
-            meshgrid_xy(torch.arange(H).to(device), torch.arange(W).to(device)),
-            dim=-1,
-        )
-        coords = coords.reshape((-1, 2))
-        select_inds = np.random.choice(
-            coords.shape[0], size=(cfg.nerf.train.num_random_rays), replace=False
-        )
-        select_inds = coords[select_inds]
-        ray_origins = ray_origins[select_inds[:, 0], select_inds[:, 1], :]
-        ray_directions = ray_directions[select_inds[:, 0], select_inds[:, 1], :]
-        # batch_rays = torch.stack([ray_origins, ray_directions], dim=0)
-        target_s = img_target[select_inds[:, 0], select_inds[:, 1], :]
-        target_ray_values = target_s
-
-    return hwf, ray_directions, ray_origins, target_ray_values
 
 
 def weak_train_log(cfg, device, epoch, stage, loss, coarse_loss, fine_loss, psnr, lr, pbar, rgb_coarse, rgb_fine, target_ray_values_coarse, target_ray_values_fine):
@@ -442,47 +368,6 @@ def weak_train_log(cfg, device, epoch, stage, loss, coarse_loss, fine_loss, psnr
         cv2.imwrite(f'{cfg.experiment.logdir}/{wandb.run.name}/{epoch + (stage * cfg.experiment.weak_train_iters)}_weak.png', img_grid)
 
 
-def get_img_grid(h, w, n, images, margin=1):  # from internet
-    if len(images) != n:
-        raise ValueError('Number of images ({}) does not match '
-                         'matrix size {}x{}'.format(len(images), w, h))
-
-    imgs = images
-
-    if any(i.shape != imgs[0].shape for i in imgs[1:]):
-        raise ValueError('Not all images have the same shape.')
-
-    img_h, img_w, img_c = imgs[0].shape
-
-    m_x = 0
-    m_y = 0
-    if margin is not None:
-        m_x = int(margin)
-        m_y = m_x
-
-    imgmatrix = np.zeros((img_h * h + m_y * (h - 1),
-                          img_w * w + m_x * (w - 1),
-                          img_c),
-                         np.uint8)
-
-    imgmatrix.fill(255)
-
-    imgmatrix = np.zeros((img_h * h + m_y * (h - 1),
-                          img_w * w + m_x * (w - 1),
-                          img_c),
-                         np.uint8)
-
-    imgmatrix.fill(255)
-
-    positions = itertools.product(range(w), range(h))
-    for (x_i, y_i), img in zip(positions, imgs):
-        x = x_i * (img_w + m_x)
-        y = y_i * (img_h + m_y)
-        imgmatrix[y:y + img_h, x:x + img_w, :] = img
-
-    return imgmatrix
-
-
 def corrective_step_log(cfg, coarse_loss, epoch, fine_loss, loss, lr, pbar, psnr, stage, net_ensemble_coarse, net_ensemble_fine):
     if epoch % cfg.experiment.print_every == 0 or epoch == cfg.experiment.weak_train_iters - 1:
         if fine_loss is not None:
@@ -517,24 +402,6 @@ def corrective_step_log(cfg, coarse_loss, epoch, fine_loss, loss, lr, pbar, psnr
             "Ensemble/corrective/psnr": psnr,
             "Ensemble/corrective/boost_rate_coarse": net_ensemble_coarse.boost_rate.item()
         }, commit=True)
-
-
-def save_checkpoint(i, logdir, loss, model_coarse, model_fine, optimizer, psnr):
-    checkpoint_dict = {
-        "iter": i,
-        "model_coarse_state_dict": model_coarse.state_dict(),
-        "model_fine_state_dict": None
-        if not model_fine
-        else model_fine.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "loss": loss,
-        "psnr": psnr,
-    }
-    torch.save(
-        checkpoint_dict,
-        os.path.join(logdir, "checkpoint" + str(i).zfill(5) + ".ckpt"),
-    )
-    tqdm.write("================== Saved Checkpoint =================")
 
 
 def validate(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_fn, encode_position_fn, i, model_coarse, model_fine):
@@ -609,80 +476,6 @@ def validate(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_f
             + f" Validation PSNR: {psnr:.5f}"
             + f" Time: {time.time() - start:.5f}"
         )
-
-
-def load_data(cfg):
-    USE_CACHED_DATASET = False
-    train_paths, validation_paths = None, None
-    images, poses, render_poses, hwf, i_split = None, None, None, None, None
-    H, W, focal, i_train, i_val, i_test = None, None, None, None, None, None
-    if hasattr(cfg.dataset, "cachedir") and os.path.exists(cfg.dataset.cachedir):
-        train_paths = glob.glob(os.path.join(cfg.dataset.cachedir, "train", "*.data"))
-        validation_paths = glob.glob(
-            os.path.join(cfg.dataset.cachedir, "val", "*.data")
-        )
-        USE_CACHED_DATASET = True
-        print("Found cache.")
-    else:
-        # Load dataset
-        print("No cache found or set, loading dataset...")
-        images, poses, render_poses, hwf = None, None, None, None
-        if cfg.dataset.type.lower() == "blender":
-            images, poses, render_poses, hwf, i_split = load_blender_data(
-                cfg.dataset.basedir,
-                half_res=cfg.dataset.half_res,
-                testskip=cfg.dataset.testskip,
-            )
-            i_train, i_val, i_test = i_split  # select data indices for training, validation, and testing
-            H, W, focal = hwf
-            H, W = int(H), int(W)
-            hwf = [H, W, focal]
-            if cfg.nerf.train.white_background:
-                images = images[..., :3] * images[..., -1:] + (1.0 - images[..., -1:])
-        elif cfg.dataset.type.lower() == "llff":
-            images, poses, bds, render_poses, i_test = load_llff_data(
-                cfg.dataset.basedir, factor=cfg.dataset.downsample_factor
-            )
-            hwf = poses[0, :3, -1]
-            poses = poses[:, :3, :4]
-            if not isinstance(i_test, list):
-                i_test = [i_test]
-            if cfg.dataset.llffhold > 0:
-                i_test = np.arange(images.shape[0])[:: cfg.dataset.llffhold]
-            i_val = i_test
-            i_train = np.array(
-                [
-                    i
-                    for i in np.arange(images.shape[0])
-                    if (i not in i_test and i not in i_val)
-                ]
-            )
-            H, W, focal = hwf
-            H, W = int(H), int(W)
-            hwf = [H, W, focal]
-            images = torch.from_numpy(images)
-            poses = torch.from_numpy(poses)
-
-    data_dict = {
-        "i_train": i_train,
-        "i_val": i_val,
-        "images": images,
-        "poses": poses,
-        "train_paths": train_paths,
-        "validation_paths": validation_paths
-    }
-
-    return hwf, USE_CACHED_DATASET, data_dict
-
-
-def cast_to_image(tensor):
-    # Input tensor is (H, W, 3). Convert to (3, H, W).
-    tensor = tensor.permute(2, 0, 1)
-    # Conver to PIL Image and then np.array (output shape: (H, W, 3))
-    img = np.array(torchvision.transforms.ToPILImage()(tensor.detach().cpu()))
-    # Map back to shape (3, H, W), as tensorboard needs channels first.
-    img = np.moveaxis(img, [-1], [0])
-    return img
 
 
 if __name__ == "__main__":

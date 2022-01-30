@@ -1,15 +1,15 @@
-from enum import Enum
 import torch
 import torch.nn as nn
 
 
 class DynamicNet:
-    def __init__(self, c0, lr):
+    def __init__(self, c0, lr, device):
         super(DynamicNet, self).__init__()
         self.models = []
         self.c0 = c0
         self.lr = lr
-        self.boost_rate = nn.Parameter(torch.tensor(lr, requires_grad=True, device="cuda"))
+        self.device = device
+        self.boost_rate = nn.Parameter(torch.tensor(lr, requires_grad=True, device=self.device))
 
     def __repr__(self):
         return str(self.models)
@@ -23,11 +23,13 @@ class DynamicNet:
             state_dicts.append(m.state_dict())
         return state_dicts
 
-    # def load_state_dict(self, state_dicts, P):
-    #     for i in range(len(state_dicts)):
-    #         model = get_model(P, i)
-    #         self.models.append(model)
-    #         self.models[i].load_state_dict(state_dicts[i])
+    def load_state_dict(self, state_dicts, cfg, get_model_fn):
+        for i in range(len(state_dicts)):
+            model = get_model_fn(cfg, i)
+            if model:
+                model.to(self.device)
+            self.models.append(model)
+            self.models[i].load_state_dict(state_dicts[i])
 
     def parameters(self, recurse=True):
         params = []
@@ -95,19 +97,3 @@ class DynamicNet:
     def __call__(self, x):
         penultimate, out = self.forward(x)
         return penultimate, out
-
-    @classmethod
-    def from_file(cls, path, builder):
-        d = torch.load(path)
-        net = DynamicNet(d['c0'], d['lr'])
-        net.boost_rate = d['boost_rate']
-        for stage, m in enumerate(d['models']):
-            submod = builder(stage)
-            submod.load_state_dict(m)
-            net.add(submod)
-        return net
-
-    def to_file(self, path):
-        models = [m.state_dict() for m in self.models]
-        d = {'models': models, 'c0': self.c0, 'lr': self.lr, 'boost_rate': self.boost_rate}
-        torch.save(d, path)

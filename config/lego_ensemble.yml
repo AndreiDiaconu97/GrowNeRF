@@ -1,7 +1,7 @@
 # Parameters to setup experiment.
 experiment:
   # Unique experiment identifier
-  id: lego-lowres_coarse8
+  id: lego-lowres_ensemble_full
   # Experiment logs will be stored at "logdir"/"id"
   logdir: logs
   # Seed for random number generators (for repeatability).
@@ -15,9 +15,9 @@ experiment:
   # Boosting rage
   boost_rate: 1.0
   # Number of training iterations after which to validate.
-  validate_every: 500 # TODO: not working for now (validation is every stage)
+  validate_every: 500 # NOTE: ignored for now (validation is done at every stage)
   # Number of training iterations after which to checkpoint.
-  save_every: 100 # ignored for now
+  save_every: 500
   # Number of training iterations after which to print progress.
   print_every: 10 # ignored for now
 
