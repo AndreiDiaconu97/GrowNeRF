@@ -7,13 +7,19 @@ experiment:
   # Seed for random number generators (for repeatability).
   randomseed: 42  # Cause, why not?
   # Number of training iterations.
-  train_iters: 200000
+  weak_train_iters: 6000
+  # Number of fully corrective steps per stage
+  corrective_iters: 100
+  # Number of stages (determines final ensemble size)
+  n_stages: 1
+  # Boosting rage
+  boost_rate: 1.0
   # Number of training iterations after which to validate.
-  validate_every: 500
+  validate_every: 500 # TODO: not working for now (validation is every stage)
   # Number of training iterations after which to checkpoint.
-  save_every: 1000
+  save_every: 100 # ignored for now
   # Number of training iterations after which to print progress.
-  print_every: 10
+  print_every: 10 # ignored for now
 
 # Dataset parameters.
 dataset:
@@ -44,10 +50,10 @@ models:
     # Name of the torch.nn.Module class that implements the model.
     type: FlexibleNeRFModel
     # Number of layers in the model.
-    num_layers: 4 # 8
+    num_layers: 2 # 8
     # Number of hidden units in each layer of the MLP (multi-layer
     # perceptron).
-    hidden_size: 16
+    hidden_size: 64
     # Add a skip connection once in a while. Note: This parameter
     # won't take effect unless num_layers > skip_connect_every.
     skip_connect_every: 4 # 3
@@ -108,6 +114,7 @@ optimizer:
   type: Adam
   # Learning rate.
   lr: 5.0E-3
+  lr_ensemble: 5.0E-3
 
 # Learning rate schedule.
 scheduler:

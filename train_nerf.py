@@ -1,8 +1,10 @@
 import argparse
 import glob
+import itertools
 import os
 import time
 from datetime import timedelta
+from math import sqrt, ceil
 
 import cv2
 import numpy as np
@@ -22,8 +24,7 @@ from nerf import (CfgNode, get_embedding_function, get_ray_bundle, img2mse,
 
 # TODO: improve config (epochs, stages, ...)
 # TODO: implement ensemble checkpointing
-# TODO: improve Wandb logging (mostly ensemble related)
-# TODO: save validation images locally (no Tensorboard)
+# TODO: improve Wandb logging (n_params, ...)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -48,7 +49,7 @@ def main():
     # torch.autograd.set_detect_anomaly(True)
 
     # If a pre-cached dataset is available, skip the dataloader.
-    hwf, USE_CACHED_DATASET, data_dict = load_data(cfg)  # TODO: maybe to class
+    hwf, USE_CACHED_DATASET, data_dict = load_data(cfg)
 
     # Seed experiment for repeatability
     seed = cfg.experiment.randomseed
@@ -75,13 +76,13 @@ def main():
             log_sampling=cfg.models.coarse.log_sampling_dir,
         )
 
-    # Setup logging.
-    logdir = os.path.join(cfg.experiment.logdir, cfg.experiment.id)
-    os.makedirs(logdir, exist_ok=True)
-    writer = SummaryWriter(logdir)
-    # Write out config parameters.
-    with open(os.path.join(logdir, "config.yml"), "w") as f:
-        f.write(cfg.dump())  # cfg, f, default_flow_style=False)
+    # Setup tensorboard logging. # OLD
+    # logdir = os.path.join(cfg.experiment.logdir, cfg.experiment.id)
+    # os.makedirs(logdir, exist_ok=True)
+    # writer = SummaryWriter(logdir)
+    # # Write out config parameters.
+    # with open(os.path.join(logdir, "config.yml"), "w") as f:
+    #     f.write(cfg.dump())  # cfg, f, default_flow_style=False)
 
     wandb_cfg = {
         "project": "GrowNeRF",
@@ -110,29 +111,24 @@ def main():
 
     ###################################################################################################################
     ### ENSEMBLE TRAINING #############################################################################################
-    c0 = torch.Tensor([0.0, 0.0, 0.0, 0.0]).to(device)
-    net_ensemble = DynamicNet(c0, lr=1.0)
+    net_ensemble_coarse = DynamicNet(c0=torch.Tensor([0.0, 0.0, 0.0, 0.0]).to(device), lr=cfg.experiment.boost_rate)
+    net_ensemble_fine = DynamicNet(c0=torch.Tensor([0.0, 0.0, 0.0, 0.0]).to(device), lr=cfg.experiment.boost_rate)
 
-    num_nets = 6
-    for stage in range(0, num_nets):
-        weak_model_coarse, weak_model_fine = train_weak(cfg, hwf, USE_CACHED_DATASET, device, writer, data_dict,
-                                                        encode_direction_fn, encode_position_fn,
-                                                        start_iter, net_ensemble, stage)
-        net_ensemble.add(weak_model_coarse)
+    for stage in range(cfg.experiment.n_stages):
+        weak_model_coarse, weak_model_fine = train_weak(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_fn, encode_position_fn, start_iter, net_ensemble_coarse, net_ensemble_fine,
+                                                        stage)
+        net_ensemble_coarse.add(weak_model_coarse)
+        net_ensemble_fine.add(weak_model_fine)
 
         if stage > 0:
-            fully_corrective_steps(cfg, hwf, USE_CACHED_DATASET, device, writer, data_dict,
-                                   encode_direction_fn, encode_position_fn,
-                                   start_iter, net_ensemble)
+            fully_corrective_steps(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_fn, encode_position_fn, start_iter, net_ensemble_coarse, net_ensemble_fine, stage)
 
-            validate(cfg, hwf, USE_CACHED_DATASET, device, writer, data_dict,
-                     encode_direction_fn, encode_position_fn, stage,
-                     model_coarse=net_ensemble, model_fine=None)
+        validate(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_fn, encode_position_fn, stage, net_ensemble_coarse, net_ensemble_fine)
     ###################################################################################################################
     print("Done!")
 
 
-def train_weak(cfg, hwf, USE_CACHED_DATASET, device, writer, data_dict, encode_direction_fn, encode_position_fn, start_iter, net_ensemble, stage):
+def train_weak(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_fn, encode_position_fn, start_iter, net_ensemble_coarse, net_ensemble_fine, stage):
     # Initialize a coarse-resolution model.
     model_coarse = getattr(models, cfg.models.coarse.type)(
         num_layers=cfg.models.coarse.num_layers,
@@ -171,22 +167,26 @@ def train_weak(cfg, hwf, USE_CACHED_DATASET, device, writer, data_dict, encode_d
         trainable_parameters, lr=cfg.optimizer.lr
     )
 
-    # for i in trange(start_iter, cfg.experiment.train_iters):
-    pbar = tqdm(range(1000), desc=f"[{str(timedelta(seconds=time.time() - start))[:-5]}] Stage {stage + 1}/{6}: weak model training", unit=" epoch")
+    net_ensemble_coarse.to_train()  # return models to train mode after validation
+    if net_ensemble_fine:
+        net_ensemble_fine.to_train()
+
+    # for i in trange(start_iter, cfg.experiment.weak_train_iters):
+    pbar = tqdm(range(cfg.experiment.weak_train_iters), desc=f"[{str(timedelta(seconds=time.time() - start))[:-5]}] Stage {stage + 1}/{cfg.experiment.n_stages}: weak model training", unit=" epoch")
     for epoch in pbar:
         model_coarse.train()  # return models to train mode after validation
         if model_fine:
             model_coarse.train()
 
         hwf, ray_directions, ray_origins, target_ray_values = get_random_rays(cfg, hwf, USE_CACHED_DATASET, device, data_dict)
-        grad_direction = target_ray_values
-
+        grad_direction_coarse, grad_direction_fine = target_ray_values, target_ray_values
         penultimate_features_coarse, penultimate_features_fine, ray_batches, pts_and_zvals = None, None, None, None
+
         if stage > 0:
             out_ensemble, penultimate_features, ray_batches, pts_and_zvals = run_one_iter_of_nerf(
                 hwf,
-                net_ensemble,
-                None,
+                net_ensemble_coarse,
+                net_ensemble_fine,
                 ray_origins,
                 ray_directions,
                 cfg,
@@ -196,7 +196,8 @@ def train_weak(cfg, hwf, USE_CACHED_DATASET, device, writer, data_dict, encode_d
             )
             rgb_coarse_ensemble, _, _, rgb_fine_ensemble, _, _ = out_ensemble  # predictions, one pixel for each ray (default: 1024 pixels)
             penultimate_features_coarse, penultimate_features_fine = penultimate_features
-            grad_direction = -(rgb_coarse_ensemble - target_ray_values)  # grad_direction = y / (1.0 + torch.exp(y * out))
+            grad_direction_coarse = -(rgb_coarse_ensemble - target_ray_values)  # grad_direction = y / (1.0 + torch.exp(y * out))
+            grad_direction_fine = -(rgb_fine_ensemble - target_ray_values)
 
         out, _, _, _ = run_one_iter_of_nerf(
             hwf,
@@ -217,22 +218,13 @@ def train_weak(cfg, hwf, USE_CACHED_DATASET, device, writer, data_dict, encode_d
 
         # LOSS + UPDATE #
         coarse_loss = F.mse_loss(
-            rgb_coarse[..., :3], grad_direction[..., :3]
+            net_ensemble_coarse.boost_rate * rgb_coarse[..., :3], grad_direction_coarse[..., :3]
         )
         fine_loss = None
         if rgb_fine is not None:
             fine_loss = F.mse_loss(
-                rgb_fine[..., :3], grad_direction[..., :3]
+                net_ensemble_fine.boost_rate * rgb_fine[..., :3], grad_direction_fine[..., :3]
             )
-
-        # coarse_loss = F.mse_loss(
-        #     rgb_coarse[..., :3], target_ray_values[..., :3]
-        # )
-        # fine_loss = None
-        # if rgb_fine is not None:
-        #     fine_loss = F.mse_loss(
-        #         rgb_fine[..., :3], target_ray_values[..., :3]
-        #     )
 
         loss = coarse_loss + (fine_loss if fine_loss is not None else 0.0)
         loss.backward()
@@ -240,42 +232,50 @@ def train_weak(cfg, hwf, USE_CACHED_DATASET, device, writer, data_dict, encode_d
         optimizer.step()
         optimizer.zero_grad()
 
+        lr_old = optimizer.param_groups[0]["lr"]
+        weak_train_log(cfg, device, epoch + 1, stage, loss, coarse_loss, fine_loss, psnr, lr_old, pbar, rgb_coarse, rgb_fine, grad_direction_coarse, grad_direction_fine)
+
         # UPDATE LR #
-        num_decay_steps = cfg.scheduler.lr_decay * 1000
+        num_decay_steps = cfg.scheduler.lr_decay * 1000  # * 1000
         lr_new = cfg.optimizer.lr * (
                 cfg.scheduler.lr_decay_factor ** (epoch / num_decay_steps)
         )
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr_new
 
-        weak_train_log(cfg, epoch + 1, loss, coarse_loss, fine_loss, psnr, writer, pbar)
-
-        # Validation #
-        # if i % cfg.experiment.validate_every == 0 or i == cfg.experiment.train_iters - 1:
+        # Weak model Validation #
+        # if i % cfg.experiment.validate_every == 0 or i == cfg.experiment.weak_train_iters - 1:
         #     loss, psnr = validate(cfg, H, W, focal, USE_CACHED_DATASET, device, encode_direction_fn, encode_position_fn, i, i_val, images, model_coarse, model_fine, poses, validation_paths, writer)
 
-        # if i % cfg.experiment.save_every == 0 or i == cfg.experiment.train_iters - 1:
+        # if i % cfg.experiment.save_every == 0 or i == cfg.experiment.weak_train_iters - 1:
         #     save_checkpoint(i, logdir, loss, model_coarse, model_fine, optimizer, psnr)
 
     return model_coarse, model_fine
 
 
-def fully_corrective_steps(cfg, hwf, USE_CACHED_DATASET, device, writer, data_dict, encode_direction_fn, encode_position_fn, start_iter, net_ensemble):
+def fully_corrective_steps(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_fn, encode_position_fn, start_iter, net_ensemble_coarse, net_ensemble_fine, stage):
     # Initialize optimizer.
+    trainable_parameters = list(net_ensemble_coarse.parameters())
+    if net_ensemble_fine is not None:
+        trainable_parameters += list(net_ensemble_fine.parameters())
     optimizer = getattr(torch.optim, cfg.optimizer.type)(
-        net_ensemble.parameters(), lr=cfg.optimizer.lr
+        trainable_parameters, lr=cfg.optimizer.lr_ensemble
     )
 
-    net_ensemble.to_train()  # return models to train mode after validation
+    net_ensemble_coarse.to_train()  # return models to train mode after validation
+    if net_ensemble_fine:
+        net_ensemble_fine.to_train()
 
-    print("CORRECTIVE STEPS...")
-    for i in trange(0, 1000):
+    # print("CORRECTIVE STEPS...")
+    pbar = tqdm(range(cfg.experiment.corrective_iters), desc=f"[{str(timedelta(seconds=time.time() - start))[:-5]}] Stage {stage + 1}/{cfg.experiment.n_stages}: fully corrective steps",
+                unit=" epoch")
+    for epoch in pbar:
         hwf, ray_directions, ray_origins, target_ray_values = get_random_rays(cfg, hwf, USE_CACHED_DATASET, device, data_dict)
 
         out_ensemble, _, _, _ = run_one_iter_of_nerf(
             hwf,
-            net_ensemble.forward_grad,
-            None,
+            net_ensemble_coarse.forward_grad,
+            net_ensemble_fine.forward_grad,
             ray_origins,
             ray_directions,
             cfg,
@@ -298,10 +298,20 @@ def fully_corrective_steps(cfg, hwf, USE_CACHED_DATASET, device, writer, data_di
 
         loss = coarse_loss + (fine_loss if fine_loss is not None else 0.0)
         loss.backward()
-        psnr = mse2psnr(loss.item())
         optimizer.step()
         optimizer.zero_grad()
-    print(psnr)
+
+        psnr = mse2psnr(loss.item())
+        lr_old = optimizer.param_groups[0]["lr"]
+        corrective_step_log(cfg, coarse_loss, epoch, fine_loss, loss, lr_old, pbar, psnr, stage, net_ensemble_coarse, net_ensemble_fine)
+
+        # UPDATE LR #
+        num_decay_steps = cfg.scheduler.lr_decay * 1000  # * 1000
+        lr_new = cfg.optimizer.lr * (
+                cfg.scheduler.lr_decay_factor ** (epoch / num_decay_steps)
+        )
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr_new
 
 
 def get_random_rays(cfg, hwf, USE_CACHED_DATASET, device, data_dict):
@@ -310,17 +320,16 @@ def get_random_rays(cfg, hwf, USE_CACHED_DATASET, device, data_dict):
     Rays are defined by `ray_origins[]` and `ray_directions[]`.
 
     :param nerf.cfgnode.CfgNode cfg: dictionary with all config parameters
-    :param int H: image height
-    :param int W: image width
-    :param float focal: cameras focal length
+    :param list[int,int,float] hwf: list containing image height, width, and cameras focal length
     :param bool USE_CACHED_DATASET: cache folder must exist for it to have an effect
     :param str device: usually "cuda" or "cpu"
-    :param None | list[int] i_train: indices of data images used for training, ignored if using cached dataset
-    :param None | torch.Tensor images: loaded dataset [H,W,N,RGB], ignored if using cached dataset
-    :param None | torch.Tensor poses: camera parameters, one camera for each image. Ignored if using cached dataset
-    :param list[str] | None train_paths: one path for each training image, ignored if dataset is not cached
-    :return: H, W, focal, ray_directions, ray_origins, target_ray_values
-    :rtype: tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor]
+    :param data_dict: contains i_train, images, poses and train_paths
+        - None | list[int] i_train: indices of data images used for training, ignored if using cached dataset
+        - None | torch.Tensor images: loaded dataset [H,W,N,RGB], ignored if using cached dataset
+        - None | torch.Tensor poses: camera parameters, one camera for each image. Ignored if using cached dataset
+        - list[str] | None train_paths: one path for each training image, ignored if dataset is not cached
+    :return: hwf, ray_directions, ray_origins, target_ray_values
+    :rtype: tuple[ list[int,int,float], torch.Tensor, torch.Tensor, torch.Tensor]
     """
 
     if USE_CACHED_DATASET:
@@ -373,8 +382,8 @@ def get_random_rays(cfg, hwf, USE_CACHED_DATASET, device, data_dict):
     return hwf, ray_directions, ray_origins, target_ray_values
 
 
-def weak_train_log(cfg, epoch, loss, coarse_loss, fine_loss, psnr, writer, pbar):
-    # if i % cfg.experiment.print_every == 0 or i == cfg.experiment.train_iters - 1:
+def weak_train_log(cfg, device, epoch, stage, loss, coarse_loss, fine_loss, psnr, lr, pbar, rgb_coarse, rgb_fine, target_ray_values_coarse, target_ray_values_fine):
+    # if i % cfg.experiment.print_every == 0 or i == cfg.experiment.weak_train_iters - 1:
     #     tqdm.write(
     #         "[TRAIN] Iter: "
     #         + str(i)
@@ -384,38 +393,130 @@ def weak_train_log(cfg, epoch, loss, coarse_loss, fine_loss, psnr, writer, pbar)
     #         + str(psnr)
     #     )
 
-    if epoch % cfg.experiment.print_every == 0 or epoch == cfg.experiment.train_iters - 1:
-        pbar.set_postfix({
-            'loss': loss.item(),
-            'loss_coarse': coarse_loss.item(),
-            # 'lr': lr,
-            # 'n_params': _n_params,
-            'psnr': psnr
-        })
-
+    if epoch % cfg.experiment.print_every == 0 or epoch == cfg.experiment.weak_train_iters - 1:
         if fine_loss is not None:
-            pbar.set_postfix({
-                'loss_fine': fine_loss.item(),
-            })
-
             wandb.log({
                 "Weak/train/loss_fine": fine_loss.item(),
             }, commit=False)
 
+            pbar.set_postfix({
+                'lr': lr,
+                'psnr': psnr,
+                'loss': loss.item(),
+                'loss_coarse': coarse_loss.item(),
+                'loss_fine': fine_loss.item(),
+                # 'n_params': _n_params,
+            })
+        else:
+            pbar.set_postfix({
+                'lr': lr,
+                'psnr': psnr,
+                'loss': loss.item(),
+                'loss_coarse': coarse_loss.item(),
+                # 'n_params': _n_params,
+            })
+
         wandb.log({
             "epoch": epoch,
             # "stage": stage,
-            # "Weak/lr": lr,
+            "Weak/train/lr": lr,
             "Weak/train/loss": loss.item(),
             "Weak/train/loss_coarse": coarse_loss.item(),
             "Weak/train/psnr": psnr,
         }, commit=True)
 
-        # writer.add_scalar("train/loss", loss.item(), epoch)
-        # writer.add_scalar("train/coarse_loss", coarse_loss.item(), epoch)
-        # if fine_loss is not None:
-        #     writer.add_scalar("train/fine_loss", fine_loss.item(), epoch)
-        # writer.add_scalar("train/psnr", psnr, epoch)
+    if epoch % 100 == 0:  # save grid of predictions
+        tensors = [rgb_coarse, target_ray_values_coarse]
+        if fine_loss is not None:
+            tensors += [rgb_fine, target_ray_values_fine]
+
+        imgs = []
+        w = ceil(sqrt(cfg.nerf.train.num_random_rays))
+
+        for t in tensors:
+            trail = torch.zeros((w ** 2 - t.shape[0], 3)).to(device)
+            t = torch.cat((t, trail))
+            imgs.append(cv2.cvtColor(t[..., :3].view(w, w, 3).detach().cpu().numpy() * 255, cv2.COLOR_BGR2RGB))
+        img_grid = get_img_grid(2, len(tensors) // 2, len(tensors), imgs, margin=1)
+
+        cv2.imwrite(f'{cfg.experiment.logdir}/{wandb.run.name}/{epoch + (stage * cfg.experiment.weak_train_iters)}_weak.png', img_grid)
+
+
+def get_img_grid(h, w, n, images, margin=1):  # from internet
+    if len(images) != n:
+        raise ValueError('Number of images ({}) does not match '
+                         'matrix size {}x{}'.format(len(images), w, h))
+
+    imgs = images
+
+    if any(i.shape != imgs[0].shape for i in imgs[1:]):
+        raise ValueError('Not all images have the same shape.')
+
+    img_h, img_w, img_c = imgs[0].shape
+
+    m_x = 0
+    m_y = 0
+    if margin is not None:
+        m_x = int(margin)
+        m_y = m_x
+
+    imgmatrix = np.zeros((img_h * h + m_y * (h - 1),
+                          img_w * w + m_x * (w - 1),
+                          img_c),
+                         np.uint8)
+
+    imgmatrix.fill(255)
+
+    imgmatrix = np.zeros((img_h * h + m_y * (h - 1),
+                          img_w * w + m_x * (w - 1),
+                          img_c),
+                         np.uint8)
+
+    imgmatrix.fill(255)
+
+    positions = itertools.product(range(w), range(h))
+    for (x_i, y_i), img in zip(positions, imgs):
+        x = x_i * (img_w + m_x)
+        y = y_i * (img_h + m_y)
+        imgmatrix[y:y + img_h, x:x + img_w, :] = img
+
+    return imgmatrix
+
+
+def corrective_step_log(cfg, coarse_loss, epoch, fine_loss, loss, lr, pbar, psnr, stage, net_ensemble_coarse, net_ensemble_fine):
+    if epoch % cfg.experiment.print_every == 0 or epoch == cfg.experiment.weak_train_iters - 1:
+        if fine_loss is not None:
+            wandb.log({
+                "Ensemble/corrective/loss_fine": fine_loss.item(),
+                "Ensemble/corrective/boost_rate_fine": net_ensemble_fine.boost_rate.item()
+            }, commit=False)
+
+            pbar.set_postfix({
+                'lr': lr,
+                'psnr': psnr,
+                'loss': loss.item(),
+                'loss_coarse': coarse_loss.item(),
+                'loss_fine': fine_loss.item(),
+                # 'n_params': _n_params,
+            })
+        else:
+            pbar.set_postfix({
+                'lr': lr,
+                'psnr': psnr,
+                'loss': loss.item(),
+                'loss_coarse': coarse_loss.item(),
+                # 'n_params': _n_params,
+            })
+
+        wandb.log({
+            "epoch": epoch,
+            "stage": stage,
+            "Ensemble/corrective/lr": lr,
+            "Ensemble/corrective/loss": loss.item(),
+            "Ensemble/corrective/loss_coarse": coarse_loss.item(),
+            "Ensemble/corrective/psnr": psnr,
+            "Ensemble/corrective/boost_rate_coarse": net_ensemble_coarse.boost_rate.item()
+        }, commit=True)
 
 
 def save_checkpoint(i, logdir, loss, model_coarse, model_fine, optimizer, psnr):
@@ -436,7 +537,7 @@ def save_checkpoint(i, logdir, loss, model_coarse, model_fine, optimizer, psnr):
     tqdm.write("================== Saved Checkpoint =================")
 
 
-def validate(cfg, hwf, USE_CACHED_DATASET, device, writer, data_dict, encode_direction_fn, encode_position_fn, i, model_coarse, model_fine):
+def validate(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_fn, encode_position_fn, i, model_coarse, model_fine):
     # tqdm.write("[VAL] =======> Iter: " + str(i))
     # model_coarse.eval()
     # if model_fine:
@@ -477,7 +578,7 @@ def validate(cfg, hwf, USE_CACHED_DATASET, device, writer, data_dict, encode_dir
         )
 
         coarse_loss = img2mse(rgb_coarse[..., :3], target_ray_values[..., :3])
-        loss, fine_loss = 0.0, 0.0
+        loss, fine_loss = None, None
         if rgb_fine is not None:
             fine_loss = img2mse(rgb_fine[..., :3], target_ray_values[..., :3])
         loss = coarse_loss + fine_loss
@@ -495,33 +596,18 @@ def validate(cfg, hwf, USE_CACHED_DATASET, device, writer, data_dict, encode_dir
             "Ensemble/validation/psnr": psnr,
         }, commit=True)
 
+        # SAVE validation prediction on file #
         cv2.imwrite(f'{cfg.experiment.logdir}/{wandb.run.name}/_ensVal_rgb_coarse{i}.png', cv2.cvtColor(rgb_coarse[..., :3].detach().cpu().numpy() * 255, cv2.COLOR_BGR2RGB))
-        cv2.imwrite(f'{cfg.experiment.logdir}/{wandb.run.name}/_ensVal_target_rgb_coarse{i}.png', cv2.cvtColor(target_ray_values[..., :3].detach().cpu().numpy() * 255, cv2.COLOR_BGR2RGB))
-
-        writer.add_scalar("validation/loss", loss.item(), i)
-        writer.add_scalar("validation/coarse_loss", coarse_loss.item(), i)
-        writer.add_scalar("validation/psnr", psnr, i)
-        writer.add_image(
-            "validation/rgb_coarse", cast_to_image(rgb_coarse[..., :3]), i
-        )
+        cv2.imwrite(f'{cfg.experiment.logdir}/{wandb.run.name}/_ensVal_target_rgb{i}.png', cv2.cvtColor(target_ray_values[..., :3].detach().cpu().numpy() * 255, cv2.COLOR_BGR2RGB))
         if rgb_fine is not None:
-            writer.add_image(
-                "validation/rgb_fine", cast_to_image(rgb_fine[..., :3]), i
-            )
-            writer.add_scalar("validation/fine_loss", fine_loss.item(), i)
-        writer.add_image(
-            "validation/img_target",
-            cast_to_image(target_ray_values[..., :3]),
-            i,
-        )
+            cv2.imwrite(f'{cfg.experiment.logdir}/{wandb.run.name}/_ensVal_rgb_fine{i}.png', cv2.cvtColor(rgb_fine[..., :3].detach().cpu().numpy() * 255, cv2.COLOR_BGR2RGB))
+        cv2.imwrite(f'{cfg.experiment.logdir}/{wandb.run.name}/_ensVal_grad{i}.png',
+                    cv2.cvtColor((target_ray_values[..., :3].detach() - rgb_coarse[..., :3].detach()).cpu().numpy() * 255, cv2.COLOR_BGR2RGB))
 
         tqdm.write(
-            "Validation loss: "
-            + str(loss.item())
-            + " Validation PSNR: "
-            + str(psnr)
-            + " Time: "
-            + str(time.time() - start)
+            f"Validation loss: {loss.item():.5f}"
+            + f" Validation PSNR: {psnr:.5f}"
+            + f" Time: {time.time() - start:.5f}"
         )
 
 

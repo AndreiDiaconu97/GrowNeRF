@@ -4,11 +4,11 @@ from .nerf_helpers import cumprod_exclusive
 
 
 def volume_render_radiance_field(
-    radiance_field,
-    depth_values,
-    ray_directions,
-    radiance_field_noise_std=0.0,
-    white_background=False,
+        radiance_field,
+        depth_values,
+        ray_directions,
+        radiance_field_noise_std=0.0,
+        white_background=False,
 ):
     """
     Render pixel maps from a radiance field given a viewpoint (`ray_directions`),\n
@@ -36,16 +36,16 @@ def volume_render_radiance_field(
     )
     dists = dists * ray_directions[..., None, :].norm(p=2, dim=-1)
 
-    rgb = torch.sigmoid(radiance_field[..., :3])
+    rgb = torch.sigmoid(radiance_field[..., :3])  # torch.tanh(radiance_field[..., :3]) # for negative pixels
     noise = 0.0
     if radiance_field_noise_std > 0.0:
         noise = (
-            torch.randn(
-                radiance_field[..., 3].shape,
-                dtype=radiance_field.dtype,
-                device=radiance_field.device,
-            )
-            * radiance_field_noise_std
+                torch.randn(
+                    radiance_field[..., 3].shape,
+                    dtype=radiance_field.dtype,
+                    device=radiance_field.device,
+                )
+                * radiance_field_noise_std
         )
         # noise = noise.to(radiance_field)
     sigma_a = torch.nn.functional.relu(radiance_field[..., 3] + noise)
