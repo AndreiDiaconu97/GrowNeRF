@@ -219,11 +219,12 @@ def run_one_iter_of_nerf(
     Predict a subsample of an image from a bunch of rays, one pixel for each. (default:1024 pixels).\n
     Build 11D rays (`ro`=3D, `rd`=3D, `near`=1D, `far`=1D, `viewdirs`=3D), and batch them before giving to `predict_and_render_radiance()` for predictions retrieval
 
+    :param list[int,int,float] hwf: height: of image, width: of image, focal length of cameras
     :param int height: of image
     :param int width: of image
     :param float focal_length: of cameras
-    :param torch.nn.Module model_coarse:
-    :param None | torch.nn.Module model_fine:
+    :param torch.nn.Module | DynamicNet model_coarse:
+    :param None | torch.nn.Module | DynamicNet model_fine:
     :param torch.Tensor ray_origins:
     :param torch.Tensor ray_directions:
     :param nerf.cfgnode.CfgNode options: dictionary with all config parameters
@@ -234,7 +235,7 @@ def run_one_iter_of_nerf(
     :param None | torch.Tensor penultimate_features_fine: is used only by weak learners, they connect to the penultimate features of the last learner of the ensemble for training
     :param None | list[torch.Tensor] ray_batches: pre-batched rays, recycled by weak learners from the ensemble in order to avoid redundant computations
     :param None | tuple[torch.Tensor, torch.Tensor] pts_and_zvals: sampled points and their intervals on rays for each model, recycled by weak learners because recomputation is affected by random noise (would sample different points)
-    :return: rgb_coarse, disp_coarse, acc_coarse, rgb_fine, disp_fine, acc_fine
+    :return: tuple(rgb_coarse, disp_coarse, acc_coarse, rgb_fine, disp_fine, acc_fine), penultimate_features, ray_batches, pts_and_zvals
     :rtype: tuple[torch.Tensor, torch.Tensor, torch.Tensor, None | torch.Tensor, None | torch.Tensor, None | torch.Tensor]
     """
 
@@ -293,7 +294,7 @@ def run_one_iter_of_nerf(
     pts_and_zvals = final_preds[-1][0]
     synthesized_images = final_preds[:-3]
     synthesized_images = [
-        torch.cat(image, dim=0) if image[0] is not None else (None)  # Remove empty elements from the list
+        torch.cat(image, dim=0) if image[0] is not None else None  # Remove empty elements from the list
         for image in synthesized_images
     ]
 
@@ -303,13 +304,14 @@ def run_one_iter_of_nerf(
             for (image, shape) in zip(synthesized_images, restore_shapes)
         ]
 
-        # Returns rgb_coarse, disp_coarse, acc_coarse, rgb_fine, disp_fine, acc_fine
-        # (assuming both the coarse and fine networks are used).
-        if model_fine:
-            return tuple(synthesized_images)
-        else:
-            # If the fine network is not used, rgb_fine, disp_fine, acc_fine are
-            # set to None.
-            return tuple(synthesized_images + [None, None, None])
+        # # Returns rgb_coarse, disp_coarse, acc_coarse, rgb_fine, disp_fine, acc_fine
+        # # (assuming both the coarse and fine networks are used).
+        # if model_fine:
+        #     return tuple(synthesized_images)
+        # else:
+        #     # If the fine network is not used, rgb_fine, disp_fine, acc_fine are
+        #     # set to None.
+        #     return tuple(synthesized_images + [None, None, None])
+        return tuple(synthesized_images), None, None, None
 
     return tuple(synthesized_images), penultimate_features, ray_batches, pts_and_zvals

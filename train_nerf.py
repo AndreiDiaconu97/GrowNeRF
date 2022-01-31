@@ -115,8 +115,11 @@ def main():
     }
     wandb.init(**wandb_cfg, dir=cfg.experiment.logdir, config=cfg)
     wandb.config.USE_CACHED_DATASET = USE_CACHED_DATASET
-    if not os.path.isdir(os.path.join(cfg.experiment.logdir, wandb.run.name)):
+    logdir = os.path.join(cfg.experiment.logdir, wandb.run.name)
+    if not os.path.isdir(logdir):
         os.mkdir(os.path.join(cfg.experiment.logdir, wandb.run.name))
+    with open(os.path.join(logdir, "config.yml"), "w") as f:
+        f.write(cfg.dump())  # cfg, f, default_flow_style=False
 
     ###################################################################################################################
     ### ENSEMBLE TRAINING #############################################################################################
@@ -432,7 +435,7 @@ def validate(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_f
             pose_target = data_dict["poses"][img_idx, :3, :4].to(device)
             ray_origins, ray_directions = get_ray_bundle(*hwf, pose_target)
 
-        rgb_coarse, _, _, rgb_fine, _, _ = run_one_iter_of_nerf(
+        out, _, _, _ = run_one_iter_of_nerf(
             hwf,
             model_coarse,
             model_fine,
@@ -443,6 +446,7 @@ def validate(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_f
             encode_position_fn=encode_position_fn,
             encode_direction_fn=encode_direction_fn,
         )
+        rgb_coarse, _, _, rgb_fine, _, _ = out
 
         coarse_loss = img2mse(rgb_coarse[..., :3], target_ray_values[..., :3])
         loss, fine_loss = None, None
