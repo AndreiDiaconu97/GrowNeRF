@@ -9,6 +9,7 @@ def volume_render_radiance_field(
         ray_directions,
         radiance_field_noise_std=0.0,
         white_background=False,
+        activation_fn=None
 ):
     """
     Render pixel maps from a radiance field given a viewpoint (`ray_directions`),\n
@@ -36,7 +37,9 @@ def volume_render_radiance_field(
     )
     dists = dists * ray_directions[..., None, :].norm(p=2, dim=-1)
 
-    rgb = torch.sigmoid(radiance_field[..., :3])  # torch.tanh(radiance_field[..., :3]) # for negative pixels
+    if not activation_fn:
+        activation_fn=torch.sigmoid
+    rgb = activation_fn(radiance_field[..., :3])  # torch.tanh(radiance_field[..., :3]) # for negative pixels
     noise = 0.0
     if radiance_field_noise_std > 0.0:
         noise = (

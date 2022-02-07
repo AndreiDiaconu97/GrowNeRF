@@ -253,10 +253,11 @@ class FlexibleNeRFModel(torch.nn.Module):
         penultimate_xyz = x
         if self.use_viewdirs:
             feat = self.relu(self.fc_feat(x))
+            # penultimate_xyz = feat # TODO: try to use this as penultimate
             alpha = self.fc_alpha(x)
             x = torch.cat((feat, view), dim=-1)
             for l in self.layers_dir:
-                x = self.relu(l(x))
+                x = self.relu(l(x)) # view dependent penultimate
             rgb = self.fc_rgb(x)
             return penultimate_xyz, torch.cat((rgb, alpha), dim=-1)
         else:

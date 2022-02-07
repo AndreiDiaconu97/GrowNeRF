@@ -17,6 +17,9 @@ class DynamicNet:
     def add(self, model):
         self.models.append(model)
 
+    def pop(self):
+        self.models.pop()
+
     def state_dict(self):
         state_dicts = []
         for m in self.models:
@@ -36,7 +39,7 @@ class DynamicNet:
         for m in self.models:
             params.extend(m.parameters())
 
-        params.append(self.boost_rate)
+        # params.append(self.boost_rate)
         return params
 
     def named_parameters(self, recurse=True):
@@ -44,7 +47,7 @@ class DynamicNet:
         for m in self.models:
             params.extend(m.named_parameters())
 
-        params.append(self.boost_rate)
+        # params.append(self.boost_rate)
         return params
 
     def zero_grad(self, set_to_none=False):

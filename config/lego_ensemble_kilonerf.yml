@@ -1,19 +1,28 @@
 # Parameters to setup experiment.
 experiment:
   # Unique experiment identifier
-  id: lego-default
+  id: lego-baseline
   # Experiment logs will be stored at "logdir"/"id"
   logdir: /media/mmlab/8A1C6A671C6A4DEF/AndreiDiaconu/GrowNeRF_out
   # Seed for random number generators (for repeatability).
   randomseed: 42  # Cause, why not?
-  # Number of training iterations.
-  train_iters: 200000
   # Number of training iterations after which to validate.
-  validate_every: 100
+  validate_every: 2000
   # Number of training iterations after which to checkpoint.
-  save_every: 5000
+  save_every: 20000
   # Number of training iterations after which to print progress.
   print_every: 100
+
+  # ENSEMBLE SETTINGS #
+  weak_train_iters: 4500
+  # Number of fully corrective steps per stage
+  corrective_iters: 500
+  # Number of stages (determines final ensemble size)
+  n_stages: 40
+  # Boosting rage
+  boost_rate: 1.0
+
+  render_activation_fn: sigmoid
 
 # Dataset parameters.
 dataset:
@@ -23,7 +32,7 @@ dataset:
   basedir: cache/nerf_synthetic/lego
   # Optionally, provide a path to the pre-cached dataset dir. This
   # overrides the other dataset options.
-  cachedir: cache/legocache/legofull
+  cachedir: cache/legocache/legofullRRRRRRRR
   # For the Blender datasets (synthetic), optionally return images
   # at half the original resolution of 800 x 800, to save space.
   half_res: True
@@ -44,10 +53,10 @@ models:
     # Name of the torch.nn.Module class that implements the model.
     type: FlexibleNeRFModel
     # Number of layers in the model.
-    num_layers: 8
+    num_layers: 3
     # Number of hidden units in each layer of the MLP (multi-layer
     # perceptron).
-    hidden_size: 128
+    hidden_size: 32
     # Add a skip connection once in a while. Note: This parameter
     # won't take affect unless num_layers > skip_connect_every.
     skip_connect_every: 3
@@ -75,10 +84,10 @@ models:
     # Name of the torch.nn.Module class that implements the model.
     type: FlexibleNeRFModel
     # Number of layers in the model.
-    num_layers: 8
+    num_layers: 3
     # Number of hidden units in each layer of the MLP (multi-layer
     # perceptron).
-    hidden_size: 128
+    hidden_size: 32
     # Add a skip connection once in a while. Note: This parameter
     # won't take affect unless num_layers > skip_connect_every.
     skip_connect_every: 3
@@ -108,6 +117,7 @@ optimizer:
   type: Adam
   # Learning rate.
   lr: 5.0E-3
+  lr_ensemble: 5.0E-3
  
 # Learning rate schedule.
 scheduler:
@@ -149,7 +159,7 @@ nerf:
   validation:
     # Number of random rays to retain from each image.
     # These sampled rays are used for training, and the others are discarded.
-    chunksize: 131072   # 1024 * 32
+    chunksize: 10000   # 1024 * 32
     # Whether or not to perturb the sampled depth values.
     perturb: False
     # Number of depth samples per ray for the coarse network.

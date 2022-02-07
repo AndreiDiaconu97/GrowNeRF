@@ -134,3 +134,7 @@ cache/
 data/
 logs/
 .idea/
+nerf_env
+nohup.out
+*.onnx
+.vscode/

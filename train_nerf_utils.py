@@ -1,6 +1,7 @@
 import glob
 import itertools
 import os
+from tabnanny import check
 
 import numpy as np
 import torch
@@ -25,11 +26,15 @@ def save_checkpoint(cfg, stage, epoch, loss, model_coarse, model_fine, ensemble_
         "loss": loss,
         "psnr": psnr,
     }
+
+    checkpoint_path = os.path.join(cfg.experiment.logdir, wandb.run.name, "checkpoint_stage" + str(stage).zfill(2) + "_epoch" + str(epoch).zfill(5) + ".ckpt")
     torch.save(
         checkpoint_dict,
-        os.path.join(cfg.experiment.logdir, wandb.run.name, "checkpoint_stage" + str(stage).zfill(2) + "_epoch" + str(epoch).zfill(5) + ".ckpt")
+        checkpoint_path
     )
     tqdm.write("================== Saved Checkpoint =================")
+
+    return checkpoint_path
 
 
 def load_checkpoint(configargs, device, net_ensemble_coarse, net_ensemble_fine):

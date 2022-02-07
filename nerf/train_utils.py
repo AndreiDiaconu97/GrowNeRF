@@ -65,6 +65,7 @@ def predict_and_render_radiance(
         penultimate_features_coarse=None,
         penultimate_features_fine=None,
         pts_and_zvals=None,
+        render_activation_fn=None
 ):
     """
     Predict a subsample of an image from a batch of rays, one pixel for each. (default:1024 pixels).
@@ -148,6 +149,7 @@ def predict_and_render_radiance(
         rd,
         radiance_field_noise_std=getattr(options.nerf, mode).radiance_field_noise_std,
         white_background=getattr(options.nerf, mode).white_background,
+        activation_fn=render_activation_fn
     )
 
     rgb_fine, disp_fine, acc_fine, radiance_field_penultimate_fine = None, None, None, None
@@ -213,7 +215,8 @@ def run_one_iter_of_nerf(
         penultimate_features_coarse=None,
         penultimate_features_fine=None,
         ray_batches=None,
-        pts_and_zvals=None
+        pts_and_zvals=None,
+        render_activation_fn=None
 ):
     """
     Predict a subsample of an image from a bunch of rays, one pixel for each. (default:1024 pixels).\n
@@ -270,7 +273,7 @@ def run_one_iter_of_nerf(
             rays = torch.cat((rays, viewdirs), dim=-1)
         ###############################################################################################################
 
-        ray_batches = get_minibatches(rays, chunksize=getattr(options.nerf, mode).chunksize)  # INFO: this is the same function as in "run_network()", why is needed here?
+        ray_batches = get_minibatches(rays, chunksize=getattr(options.nerf, mode).chunksize)
 
     pred = [
         predict_and_render_radiance(
@@ -283,7 +286,8 @@ def run_one_iter_of_nerf(
             encode_direction_fn,
             penultimate_features_coarse,
             penultimate_features_fine,
-            pts_and_zvals
+            pts_and_zvals,
+            render_activation_fn
         )
         for batch in ray_batches
     ]

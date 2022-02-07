@@ -3,7 +3,7 @@ experiment:
   # Unique experiment identifier
   id: lego-lowres_ensemble_coarse
   # Experiment logs will be stored at "logdir"/"id"
-  logdir: logs
+  logdir: /media/mmlab/8A1C6A671C6A4DEF/AndreiDiaconu/GrowNeRF_out
   # Seed for random number generators (for repeatability).
   randomseed: 42  # Cause, why not?
   # Number of training iterations.

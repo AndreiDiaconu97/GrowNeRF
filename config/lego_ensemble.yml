@@ -1,25 +1,26 @@
 # Parameters to setup experiment.
 experiment:
   # Unique experiment identifier
-  id: lego-lowres_ensemble_full
+  id: lego-baseline
   # Experiment logs will be stored at "logdir"/"id"
-  logdir: logs
+  logdir: /media/mmlab/8A1C6A671C6A4DEF/AndreiDiaconu/GrowNeRF_out
   # Seed for random number generators (for repeatability).
   randomseed: 42  # Cause, why not?
-  # Number of training iterations.
-  weak_train_iters: 1000
+  # Number of training iterations after which to validate.
+  validate_every: 2000
+  # Number of training iterations after which to checkpoint.
+  save_every: 20000
+  # Number of training iterations after which to print progress.
+  print_every: 100
+
+  # ENSEMBLE SETTINGS #
+  weak_train_iters: 23000
   # Number of fully corrective steps per stage
-  corrective_iters: 100
+  corrective_iters: 2000
   # Number of stages (determines final ensemble size)
-  n_stages: 6
+  n_stages: 8
   # Boosting rage
   boost_rate: 1.0
-  # Number of training iterations after which to validate.
-  validate_every: 500 # NOTE: ignored for now (validation is done at every stage)
-  # Number of training iterations after which to checkpoint.
-  save_every: 500
-  # Number of training iterations after which to print progress.
-  print_every: 10 # ignored for now
 
 # Dataset parameters.
 dataset:
@@ -29,7 +30,7 @@ dataset:
   basedir: cache/nerf_synthetic/lego
   # Optionally, provide a path to the pre-cached dataset dir. This
   # overrides the other dataset options.
-  cachedir: cache/legocache/legofull
+  cachedir: cache/legocache/legofullRRRRRRRR
   # For the Blender datasets (synthetic), optionally return images
   # at half the original resolution of 800 x 800, to save space.
   half_res: True
@@ -50,30 +51,30 @@ models:
     # Name of the torch.nn.Module class that implements the model.
     type: FlexibleNeRFModel
     # Number of layers in the model.
-    num_layers: 2 # 8
+    num_layers: 1
     # Number of hidden units in each layer of the MLP (multi-layer
     # perceptron).
-    hidden_size: 64
+    hidden_size: 128
     # Add a skip connection once in a while. Note: This parameter
-    # won't take effect unless num_layers > skip_connect_every.
-    skip_connect_every: 4 # 3
+    # won't take affect unless num_layers > skip_connect_every.
+    skip_connect_every: 3
     # Whether to include the position (xyz) itself in its positional
     # encoding.
     include_input_xyz: True
-    # Whether to perform log sampling in the positional encoding
+    # Whether or not to perform log sampling in the positional encoding
     # of the coordinates.
     log_sampling_xyz: True
     # Number of encoding functions to use in the positional encoding
     # of the coordinates.
     num_encoding_fn_xyz: 10
-    # Additionally, use viewing directions as input.
+    # Additionally use viewing directions as input.
     use_viewdirs: True
     # Whether to include the direction itself in its positional encoding.
     include_input_dir: True
     # Number of encoding functions to use in the positional encoding
     # of the direction.
     num_encoding_fn_dir: 4
-    # Whether to perform log sampling in the positional encoding
+    # Whether or not to perform log sampling in the positional encoding
     # of the direction.
     log_sampling_dir: True
   # Fine model.
@@ -81,20 +82,20 @@ models:
     # Name of the torch.nn.Module class that implements the model.
     type: FlexibleNeRFModel
     # Number of layers in the model.
-    num_layers: 2
+    num_layers: 1
     # Number of hidden units in each layer of the MLP (multi-layer
     # perceptron).
-    hidden_size: 64
+    hidden_size: 128
     # Add a skip connection once in a while. Note: This parameter
-    # won't take effect unless num_layers > skip_connect_every.
-    skip_connect_every: 4
+    # won't take affect unless num_layers > skip_connect_every.
+    skip_connect_every: 3
     # Number of encoding functions to use in the positional encoding
     # of the coordinates.
     num_encoding_fn_xyz: 10
     # Whether to include the position (xyz) itself in its positional
     # encoding.
     include_input_xyz: True
-    # Whether to perform log sampling in the positional encoding
+    # Whether or not to perform log sampling in the positional encoding
     # of the coordinates.
     log_sampling_xyz: True
     # Additionally use viewing directions as input.
@@ -104,7 +105,7 @@ models:
     # Number of encoding functions to use in the positional encoding of
     # the direction.
     num_encoding_fn_dir: 4
-    # Whether to perform log sampling in the positional encoding
+    # Whether or not to perform log sampling in the positional encoding
     # of the direction.
     log_sampling_dir: True
 
@@ -115,7 +116,7 @@ optimizer:
   # Learning rate.
   lr: 5.0E-3
   lr_ensemble: 5.0E-3
-
+ 
 # Learning rate schedule.
 scheduler:
   # Exponentially decay learning rate (in 1000 steps)
@@ -138,15 +139,15 @@ nerf:
     num_random_rays: 1024  # 32 * 32 * 4
     # Size of each chunk (rays are batched into "chunks" and passed through
     # the network)
-    chunksize: 51200  # 131072  # 1024 * 32
-    # Whether to perturb the sampled depth values.
+    chunksize: 131072  # 131072  # 1024 * 32
+    # Whether or not to perturb the sampled depth values.
     perturb: True
     # Number of depth samples per ray for the coarse network.
     num_coarse: 64
     # Number of depth samples per ray for the fine network.
     num_fine: 64
     # Whether to render models using a white background.
-    white_background: True
+    white_background: False
     # Standard deviation of noise to be added to the radiance field when
     # performing volume rendering.
     radiance_field_noise_std: 0.2
@@ -156,15 +157,15 @@ nerf:
   validation:
     # Number of random rays to retain from each image.
     # These sampled rays are used for training, and the others are discarded.
-    chunksize: 16384   # 1024 * 32
-    # Whether to perturb the sampled depth values.
+    chunksize: 10000   # 1024 * 32
+    # Whether or not to perturb the sampled depth values.
     perturb: False
     # Number of depth samples per ray for the coarse network.
     num_coarse: 64
     # Number of depth samples per ray for the fine network.
     num_fine: 64
     # Whether to render models using a white background.
-    white_background: True
+    white_background: False
     # Standard deviation of noise to be added to the radiance field when
     # performing volume rendering.
     radiance_field_noise_std: 0.
