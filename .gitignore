@@ -135,6 +135,6 @@ data/
 logs/
 .idea/
 nerf_env
-nohup.out
+nohup*
 *.onnx
 .vscode/

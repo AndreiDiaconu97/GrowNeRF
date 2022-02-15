@@ -5,64 +5,73 @@
 free_device=1
 echo "Most free GPU: ${free_device}"
 
+
 generate_cache () {
 	echo "Generating cache..."
 	python cache_dataset.py --datapath cache/nerf_synthetic/lego/ --savedir cache/legocache/legofull --num-random-rays 8192 --num-variations 50 --type blender
 	echo "Cache created"
 }
 
-run_eval () {
-	local path=${1}
-    local checkpoint=${2}
-	echo "Running eval..."
-	echo "	path=${path}	checkpoint=${checkpoint}"
+run_lego="CUDA_VISIBLE_DEVICES=${free_device} python train_nerf.py --config config/grownet_lego.yml --max_mins 180"
 
-	CUDA_VISIBLE_DEVICES=${free_device} python eval_nerf.py --config ${path}/config.yml --checkpoint ${path}/${checkpoint} --savedir ${path}/rendered
-}
+# MISC #
+# eval $run_lego --run-name ensemble_default_newDecay
+# eval $run_lego --run-name kilonerf_baseline_500000 				--depth 3 --width 32 --weak_iters 500000 --corrective_iters 0  --n_stages 1
+# eval $run_lego --run-name kilonerf_baseline_500000_longerDecay 	--depth 3 --width 32 --weak_iters 500000 --corrective_iters 0  --n_stages 1 --lr_decay_weak 500000
 
-run_train () {
-	local cfg_path=${1}
-	local run_name=${2}
+# TEST TRAIN/CORRECTIVE RATIO #
+# eval $run_lego --run-name kilonerf_D3W32_9000WI1000CI_N20 	--depth 3 --width 32 --weak_iters 9000 --corrective_iters 1000 --n_stages 20
 
-	echo "Running train..."
-	echo "	config=${cfg_path}"
+# eval $run_lego --run-name kilonerf_D3W32_4500WI500CI_N40 	--depth 3 --width 32 --weak_iters 4500 --corrective_iters 500  --n_stages 40
+# eval $run_lego --run-name kilonerf_D3W32_5000WI0CI_N40 		--depth 3 --width 32 --weak_iters 5000 --corrective_iters 0    --n_stages 40
+# eval $run_lego --run-name kilonerf_D3W32_5000WI0CI_N40_tanh --depth 3 --width 32 --weak_iters 5000 --corrective_iters 0    --n_stages 40 --render_activation_fn tanh
+# eval $run_lego --run-name kilonerf_D3W32_500WI4500CI_N40 	--depth 3 --width 32 --weak_iters 500  --corrective_iters 4500 --n_stages 40
+# eval $run_lego --run-name kilonerf_D3W32_1WI5000CI_N40 		--depth 3 --width 32 --weak_iters 1    --corrective_iters 5000 --n_stages 40
 
-	if [ -z "$run_name" ]; then local r=""; else local r="--run-name ${run_name}"; fi
-	CUDA_VISIBLE_DEVICES=${free_device} python train_nerf.py --config ${cfg_path} $r
-}
+# TEST LEARNING RATE DECAY #
+# eval $run_lego --run-name kilonerf_D3W32_4500WI500CI_N40_decayW4500 		  --depth 3 --width 32 --weak_iters 4500 --corrective_iters 500 --n_stages 40 --lr_decay_weak 4500
+eval $run_lego --run-name kilonerf_D3W32_4500WI500CI_N40_noRSTweak 		      --depth 3 --width 32 --weak_iters 4500 --corrective_iters 500 --n_stages 40 --lr_reset_weak False
+# eval $run_lego --run-name kilonerf_D3W32_4500WI500CI_N40_decayC500_RSTcorr    --depth 3 --width 32 --weak_iters 4500 --corrective_iters 500 --n_stages 40 --lr_decay_corrective 500 --lr_reset_corrective True
+# eval $run_lego --run-name kilonerf_D3W32_500WI4500CI_N40_decayC100000_Peak0.5 --depth 3 --width 32 --weak_iters 500 --corrective_iters 4500 --n_stages 40 --lr_decay_corrective 100000 --lr_decay_corrective_peaked 0.5
 
-# generate_cache 
-# run_eval logs/happy-darkness-112 checkpoint_stage02_epoch00000.ckpt
+# TEST NETWORK SIZES #
+eval $run_lego --run-name kilonerf_D2W32_4500WI500CI_N40   --depth 2 --width 32 --weak_iters 4500 --corrective_iters 500   --n_stages 40
+eval $run_lego --run-name kilonerf_D3W32_4500WI500CI_N40   --depth 3 --width 32 --weak_iters 4500 --corrective_iters 500   --n_stages 40
+eval $run_lego --run-name kilonerf_D4W32_4500WI500CI_N40   --depth 4 --width 32 --weak_iters 4500 --corrective_iters 500   --n_stages 40
 
-# run_train config/lego_baseline.yml baseline
-# run_train config/lego_baseline_smaller.yml baseline_4l
-# run_train config/lego_baseline_double_importance.yml baseline_128importance
-# run_train config/lego_baseline_tanh.yml baseline_tanh
-# run_train config/lego_baseline_kilonerf.yml baseline_kilonerf
+eval $run_lego --run-name kilonerf_D2W64_4500WI500CI_N40   --depth 2 --width 64 --weak_iters 2500 --corrective_iters 2500  --n_stages 40
+eval $run_lego --run-name kilonerf_D3W64_4500WI500CI_N40   --depth 3 --width 64 --weak_iters 2500 --corrective_iters 2500  --n_stages 40
+eval $run_lego --run-name kilonerf_D4W64_4500WI500CI_N40   --depth 4 --width 64 --weak_iters 2500 --corrective_iters 2500  --n_stages 40
 
-# run_train config/lego_ensemble.yml ensemble_23000iters_2000corr_8weak_1layer
-# run_train config/lego_ensemble.yml ensemble_23000iters_2000corr_8weak_1layer_tanh # CODE MODIFICATION
-# run_train config/lego_ensemble_kilonerf_tanh.yml ensemble_kilonerf_noLRreset_tanh
-# run_train config/lego_ensemble_kilonerf.yml ensemble_kilonerf_noLRreset
-# run_train config/lego_ensemble.yml ensemble_23000iters_2000corr_8weak_1layer_corrLRnoReset_tanh # CODE MODIFICATION
+# OTHER #
+# eval $run_lego --run-name ensemble_D2W128_N8 			   --depth 2 													 --n_stages 8
+# eval $run_lego --run-name ensemble_D2W128_9000WI1000CI_N16 --depth 2 		   --weak_iters 9000 --corrective_iters 1000 --n_stages 16
+# eval $run_lego --run-name ensemble_D2W128_N8_tanh			   		--depth 2 											 --n_stages 8 	--render_activation_fn tanh
+# eval $run_lego --run-name ensemble_D2W128_9000WI1000CI_N16_tanh 	--depth 2  --weak_iters 9000 --corrective_iters 1000 --n_stages 16 	--render_activation_fn tanh
+# eval $run_lego --run-name ensemble_D2W128_1000WI9000CI_N16 			--depth 2  --weak_iters 1000 --corrective_iters 9000 --n_stages 16
+# eval $run_lego --run-name ensemble_D2W128_500WI4500CI_N16 			--depth 2  --weak_iters 500  --corrective_iters 4500 --n_stages 32
 
-# run_train config/lego_ensemble_kilonerf.yml ensemble_kilonerf_2000iters_8000corr
-# run_train config/lego_ensemble_kilonerf.yml ensemble_kilonerf_2000iters_8000corr_tanh
-# run_train config/lego_ensemble_kilonerf_fiftyfifty.yml ensemble_kilonerf_fiftyfifty
-# run_train config/lego_ensemble_kilonerf.yml ensemble_kilonerf_resetEnsembleLR
-# run_train config/lego_ensemble_kilonerf.yml ensemble_500iters_9500corr
-
-run_train config/lego_ensemble_kilonerf.yml ensemble_4500iters_500corr_LRpeakDecay
-run_train config/lego_ensemble_kilonerf_64.yml ensemble_kilonerf_4500iters_500corr_64_LRpeakDecay
-
+# TEST LEARNING RATE VALUES
+# eval $run_lego --run-name kilonerf_D3W32_4500WI500CI_N40_LRhigh 	--depth 3 --width 32 --weak_iters 4500 --corrective_iters 500  --n_stages 40 --lr 5.0E-2
+# eval $run_lego --run-name kilonerf_D3W32_4500WI500CI_N40_LRlow 		--depth 3 --width 32 --weak_iters 4500 --corrective_iters 500  --n_stages 40 --lr 5.0E-4
+eval $run_lego --run-name kilonerf_D3W32_500WI4500CI_N40_ensLRhigh 	--depth 3 --width 32 --weak_iters 500  --corrective_iters 4500 --n_stages 40 --lr_ensemble 5.0E-2
+eval $run_lego --run-name kilonerf_D3W32_500WI4500CI_N40_ensLRlow 	--depth 3 --width 32 --weak_iters 500  --corrective_iters 4500 --n_stages 40 --lr_ensemble 5.0E-4
 
 
-# Last nohup PID: 645030
+# TEST BOOSTING RATE
+# ...coming...
+
+
+# Last nohup PID: 163590
 
 # TODO:
 # don't reset training rates of weak or ensemble, or both
-# try without fully corrective steps
-# try with boosting rate
 # TRY WITH NO VIEW-DEPENDENT PART
 # TRY WITH CLASSICAL NERF (no flexibleNeRF)
-# PUT skip connection every 4 (ORIGINAL) instead of 3
+# TRY SINGLE COARSE + FINE ENSEMBLE
+# TRY WITHOUT CONTEXT PROPAGATION
+
+# MULTIRESOLUTION
+# - FROM BIG TO SMALL <- THIS
+# - FROM SMALL TO BIG
+# AGAIN, bigger weaks (64)

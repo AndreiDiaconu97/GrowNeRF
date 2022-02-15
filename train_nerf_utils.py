@@ -8,8 +8,246 @@ import torch
 import torchvision
 import wandb
 from tqdm import tqdm
+import yaml
+import argparse
 
-from nerf import models, load_blender_data, load_llff_data, get_ray_bundle, meshgrid_xy
+
+from nerf import models, load_blender_data, load_llff_data, get_ray_bundle, meshgrid_xy, CfgNode
+
+def str_to_bool(value):
+    if isinstance(value, bool):
+        return value
+    if value.lower() in {'false', 'f', '0', 'no', 'n'}:
+        return False
+    elif value.lower() in {'true', 't', '1', 'yes', 'y'}:
+        return True
+    raise ValueError(f'{value} is not a valid boolean value')
+
+def load_config():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', required=True, 
+                        help='config file path')
+    # parser.add_argument("--expname", type=str, 
+    #                     help='experiment name', required=False)
+    # parser.add_argument("--basedir", type=str, default='cache/nerf_synthetic/lego', 
+    #                     help='where to store ckpts and logs')
+    # parser.add_argument("--datadir", type=str, default='./data/llff/fern', 
+    #                     help='input data directory')
+
+    # training options
+    parser.add_argument("--depth", type=int, 
+                        help='layers in network')
+    parser.add_argument("--width", type=int, 
+                        help='channels per layer')
+    parser.add_argument("--num_random_rays", type=int, 
+                        help='batch size (number of random rays per gradient step)')
+    parser.add_argument("--lr", type=float, 
+                        help='learning rate')
+    parser.add_argument("--lr_ensemble", type=float, 
+                        help='learning rate of ensemble fully corrective steps')
+    parser.add_argument("--lr_decay_weak", type=int, 
+                        help='exponential learning rate decay for weak lr')
+    parser.add_argument("--lr_decay_corrective", type=int, 
+                        help='exponential learning rate decay for corrective lr')
+    parser.add_argument("--lr_decay_factor_weak", type=float, 
+                        help='strength of the decay for weak lr')
+    parser.add_argument("--lr_decay_factor_corrective", type=float, 
+                        help='strength of the decay for corrective lr')
+    parser.add_argument("--chunksize", type=int, 
+                        help='number of rays processed in parallel, decrease if running out of memory')
+    # parser.add_argument("--netchunk", type=int, default=1024*64, 
+    #                     help='number of pts sent through network in parallel, decrease if running out of memory')
+    # parser.add_argument("--no_batching", action='store_true', 
+    #                     help='only take random rays from 1 image at a time')
+    # parser.add_argument("--no_reload", action='store_true', 
+    #                     help='do not reload weights from saved ckpt')
+    # parser.add_argument("--ft_path", type=str, default=None, 
+    #                     help='specific weights npy file to reload for coarse network')
+
+    # rendering options
+    parser.add_argument("--samples_coarse", type=int, 
+                        help='number of coarse samples per ray')
+    parser.add_argument("--samples_fine", type=int,
+                        help='number of additional fine samples per ray')
+    parser.add_argument("--perturb", type=str_to_bool,
+                        help='set to False for no jitter, True for jitter')
+    parser.add_argument("--use_viewdirs", type=str_to_bool, 
+                        help='use full 5D input instead of 3D')
+    # parser.add_argument("--i_embed", type=int, 
+    #                     help='set 0 for default positional encoding, -1 for none')
+    parser.add_argument("--num_encoding_xyz", type=int, 
+                        help='log2 of max freq for positional encoding (3D location)')
+    parser.add_argument("--num_encoding_dir", type=int, 
+                        help='log2 of max freq for positional encoding (2D direction)')
+    parser.add_argument("--raw_noise_std", type=float, 
+                        help='std dev of noise added to regularize sigma_a output, 1e0 recommended')
+
+    # parser.add_argument("--render_only", action='store_true', 
+    #                     help='do not optimize, reload weights and render out render_poses path')
+    # parser.add_argument("--render_test", action='store_true', 
+    #                     help='render the test set instead of render_poses path')
+    # parser.add_argument("--render_factor", type=int, 
+    #                     help='downsampling factor to speed up rendering, set 4 or 8 for fast preview')
+
+    # training options
+    # parser.add_argument("--precrop_iters", type=int, default=0,
+    #                     help='number of steps to train on central crops')
+    # parser.add_argument("--precrop_frac", type=float,
+    #                     default=.5, help='fraction of img taken for central crops') 
+
+    # dataset options
+    parser.add_argument("--dataset_type", type=str, 
+                        help='options: llff / blender / deepvoxels')
+    parser.add_argument("--testskip", type=int, 
+                        help='will load 1/N images from test/val sets, useful for large datasets like deepvoxels')
+
+    ## deepvoxels flags
+    # parser.add_argument("--shape", type=str, default='greek', 
+    #                     help='options : armchair / cube / greek / vase')
+
+    ## blender flags
+    parser.add_argument("--white_bkgd", type=str_to_bool, 
+                        help='set to render synthetic data on a white bkgd (always use for dvoxels)')
+    parser.add_argument("--half_res", type=str_to_bool, 
+                        help='load blender synthetic data at 400x400 instead of 800x800')
+
+    ## llff flags
+    # parser.add_argument("--factor", type=int, default=8, 
+    #                     help='downsample factor for LLFF images')
+    # parser.add_argument("--no_ndc", action='store_true', 
+    #                     help='do not use normalized device coordinates (set for non-forward facing scenes)')
+    # parser.add_argument("--lindisp", action='store_true', 
+    #                     help='sampling linearly in disparity rather than depth')
+    # parser.add_argument("--spherify", action='store_true', 
+    #                     help='set for spherical 360 scenes')
+    # parser.add_argument("--llffhold", type=int, default=8, 
+    #                     help='will take every 1/N images as LLFF test set, paper uses 8')
+
+    # logging/saving options
+    # parser.add_argument("--i_print",   type=int, default=100, 
+    #                     help='frequency of console printout and metric loggin')
+    # parser.add_argument("--i_img",     type=int, default=500, 
+    #                     help='frequency of tensorboard image logging')
+    # parser.add_argument("--i_weights", type=int, default=10000, 
+    #                     help='frequency of weight ckpt saving')
+    # parser.add_argument("--i_testset", type=int, default=50000, 
+    #                     help='frequency of testset saving')
+    # parser.add_argument("--i_video",   type=int, default=50000, 
+    #                     help='frequency of render_poses video saving')
+
+    ### Mine ###
+
+    parser.add_argument("--max_mins", type=int, 
+                        help='Maximum duration of the experiment, in minutes')
+    parser.add_argument("--load-checkpoint", type=str, default="",
+                        help="Path to load saved checkpoint from. Creates separate run",)
+    parser.add_argument("--resume", type=str_to_bool,
+                        help="Resume from last checkpoint. (On wandb too)")
+    parser.add_argument("--run-name", type=str, required=True,
+                        help="Name of the run (for wandb), leave empty for random name.")
+
+    parser.add_argument("--weak_iters", type=int, 
+                        help='number of iterations for the training of a weak learner')
+    parser.add_argument("--corrective_iters", type=int, 
+                        help='number of corrective steps of the ensemble')
+    parser.add_argument("--n_stages", type=int, 
+                        help='final number of weak learners')
+    parser.add_argument("--boost_rate", type=float, 
+                        help='boosting rate of grownet')
+    parser.add_argument("--render_activation_fn", type=str, 
+                        help='torch activation function to use (sigmoid, tanh, ...)')
+
+    parser.add_argument("--lr_reset_weak", type=str_to_bool,
+                        help="Wether to restart the scheduler for each new weak learner")
+    parser.add_argument("--lr_reset_corrective", type=str_to_bool,
+                        help="Wether to restart the scheduler for each corrective phase")
+    parser.add_argument("--lr_decay_corrective_peaked", type=float, 
+                        help='multiplier used to create peaks in the scheduler (works only if lr_reset_corrective: False)')
+    parser.add_argument("--no_fine", type=str_to_bool,
+                        help="Wether to use the fine model")
+
+    args = parser.parse_args()
+
+    # Read config file.
+    cfg = None
+    with open(args.config, "r") as f:
+        cfg_dict = yaml.load(f, Loader=yaml.FullLoader)
+        cfg = CfgNode(cfg_dict)
+
+    # Update cfg with user arguments
+    if args.chunksize is not None:
+        cfg.nerf.train.chunksize= args.chunksize
+        cfg.nerf.validation.chunksize= args.chunksize
+    if args.dataset_type is not None:
+        cfg.dataset.type= args.dataset_type
+    if args.depth is not None:
+        cfg.models.coarse.num_layers = args.depth
+        cfg.models.fine.num_layers = args.depth
+    if args.half_res is not None:
+        cfg.dataset.half_res = args.half_res
+    if args.lr is not None:
+        cfg.optimizer.lr = args.lr
+    if args.lr_decay_weak is not None:
+        cfg.scheduler.lr_decay_weak = args.lr_decay_weak
+    if args.lr_decay_weak is not None:
+        cfg.scheduler.lr_decay_corrective = args.lr_decay_corrective
+    if args.lr_decay_factor_weak is not None:
+        cfg.scheduler.lr_decay_factor_weak = args.lr_decay_factor_weak
+    if args.lr_decay_factor_corrective is not None:
+        cfg.scheduler.lr_decay_factor_corrective = args.lr_decay_factor_corrective
+    if args.lr_ensemble is not None:
+        cfg.optimizer.lr_ensemble = args.lr_ensemble
+    if args.num_encoding_dir is not None:
+        cfg.models.coarse.num_encoding_fn_dir = args.num_encoding_dir
+        cfg.models.fine.num_encoding_fn_dir = args.num_encoding_dir
+    if args.num_encoding_xyz is not None:
+        cfg.models.coarse.num_encoding_fn_xyz = args.num_encoding_xyz
+        cfg.models.fine.num_encoding_fn_xyz = args.num_encoding_xyz
+    if args.num_random_rays is not None:
+        cfg.nerf.train.num_random_rays = args.num_random_rays
+    if args.perturb is not None:
+        cfg.nerf.train.perturb = args.perturb
+    if args.raw_noise_std is not None:
+        cfg.nerf.train.radiance_field_noise_std = args.raw_noise_std
+    if args.samples_coarse is not None:
+        cfg.nerf.train.num_coarse = args.samples_coarse
+    if args.samples_fine is not None:
+        cfg.nerf.train.num_fine = args.samples_fine
+    if args.testskip is not None:
+        cfg.dataset.testskip = args.testskip
+    if args.use_viewdirs is not None:
+        cfg.models.coarse.use_viewdirs = args.use_viewdirs
+        cfg.models.fine.use_viewdirs = args.use_viewdirs
+        cfg.nerf.use_viewdirs = args.use_viewdirs
+    if args.white_bkgd is not None:
+        cfg.nerf.train.white_background = args.white_bkgd
+        cfg.nerf.validation.white_background = args.white_bkgd
+    if args.width is not None:
+        cfg.models.coarse.hidden_size = args.width
+        cfg.models.fine.hidden_size = args.width
+    if args.weak_iters is not None:
+        cfg.experiment.weak_train_iters = args.weak_iters
+    if args.corrective_iters is not None:
+        cfg.experiment.corrective_iters = args.corrective_iters
+    if args.n_stages is not None:
+        cfg.experiment.n_stages = args.n_stages
+    if args.boost_rate is not None:
+        cfg.experiment.boost_rate = args.boost_rate
+    if args.render_activation_fn is not None:
+        cfg.experiment.render_activation_fn = args.render_activation_fn
+    if args.lr_decay_corrective_peaked is not None:
+        cfg.scheduler.lr_decay_corrective_peaked = args.lr_decay_corrective_peaked
+    if args.no_fine is not None:
+        cfg.models.no_fine = args.no_fine  
+        cfg.nerf.train.num_fine = 0
+        cfg.nerf.validation.num_fine = 0
+    if args.lr_reset_weak is not None:
+        cfg.scheduler.lr_reset_weak = args.lr_reset_weak
+    if args.lr_reset_corrective is not None:
+        cfg.scheduler.lr_reset_corrective = args.lr_reset_corrective
+    
+
+    return cfg, args
 
 
 def save_checkpoint(cfg, stage, epoch, loss, model_coarse, model_fine, ensemble_coarse, ensemble_fine, optimizer, psnr):
@@ -86,7 +324,8 @@ def get_model_coarse(cfg, stage):
 
 def get_model_fine(cfg, stage):
     model_fine = None
-    if hasattr(cfg.models, "fine"):
+    # if hasattr(cfg.models, "fine"):
+    if not cfg.models.no_fine:
         model_fine = getattr(models, cfg.models.fine.type)(
             num_layers=cfg.models.fine.num_layers,
             hidden_size=cfg.models.fine.hidden_size,

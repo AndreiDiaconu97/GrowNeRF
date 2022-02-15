@@ -112,5 +112,7 @@ def load_blender_data(basedir, half_res=False, testskip=1, debug=False):
         imgs = torch.stack(imgs, 0)
 
     poses = torch.from_numpy(poses)
+    if not torch.is_tensor(imgs):
+        imgs = torch.from_numpy(imgs)
 
     return imgs, poses, render_poses, [H, W, focal], i_split

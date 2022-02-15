@@ -225,11 +225,13 @@ class FlexibleNeRFModel(torch.nn.Module):
             self.layers_dir = torch.nn.ModuleList()
             # This deviates from the original paper, and follows the code release instead.
             self.layers_dir.append(
-                torch.nn.Linear(self.dim_dir + hidden_size, hidden_size // 2)
+                # torch.nn.Linear(self.dim_dir + hidden_size, hidden_size // 2)
+                torch.nn.Linear(self.dim_dir + hidden_size, hidden_size // 1)
             )
 
             self.fc_alpha = torch.nn.Linear(hidden_size, 1)
-            self.fc_rgb = torch.nn.Linear(hidden_size // 2, 3)
+            # self.fc_rgb = torch.nn.Linear(hidden_size // 2, 3)
+            self.fc_rgb = torch.nn.Linear(hidden_size // 1, 3)
             self.fc_feat = torch.nn.Linear(hidden_size, hidden_size)
         else:
             self.fc_out = torch.nn.Linear(hidden_size, 4)

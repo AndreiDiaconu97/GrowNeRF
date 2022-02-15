@@ -14,35 +14,11 @@ from tqdm import tqdm
 
 from grownet.grownet import DynamicNet
 from nerf import (CfgNode, get_embedding_function, get_ray_bundle, img2mse, mse2psnr, run_one_iter_of_nerf)
-from train_nerf_utils import load_checkpoint, get_img_grid, save_checkpoint, load_data, get_random_rays, get_model_coarse, get_model_fine
+from train_nerf_utils import load_checkpoint, get_img_grid, load_config, save_checkpoint, load_data, get_random_rays, get_model_coarse, get_model_fine
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--config", type=str, required=True, help="Path to (.yml) config file."
-    )
-    parser.add_argument(  # loading checkpoint ignores config argument
-        "--load-checkpoint",
-        type=str,
-        default="",
-        help="Path to load saved checkpoint from. Creates separate run",
-    )
-    parser.add_argument(
-        "--resume", action="store_true", help="Resume from last checkpoint. (On wandb too)"
-    )
-    parser.add_argument(  # loading checkpoint ignores config argument
-        "--run-name",
-        type=str,
-        default="",
-        help="Name of the run (for wandb), leave empty for random name.",
-    )
-    configargs = parser.parse_args()
-
-    # Read config file.
-    cfg = None
-    with open(configargs.config, "r") as f:
-        cfg_dict = yaml.load(f, Loader=yaml.FullLoader)
-        cfg = CfgNode(cfg_dict)
+    cfg, configargs = load_config()
+    MAX_MINUTES = configargs.max_mins
 
     # # (Optional:) enable this to track autograd issues when debugging
     # torch.autograd.set_detect_anomaly(True)
@@ -140,14 +116,20 @@ def main():
             weak_model_coarse, weak_model_fine = train_weak(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_fn, encode_position_fn, 0, net_ensemble_coarse,
                                                             net_ensemble_fine, stage)
         net_ensemble_coarse.add(weak_model_coarse)
-        net_ensemble_fine.add(weak_model_fine)
+        if weak_model_fine is not None:
+            net_ensemble_fine.add(weak_model_fine)
 
         if stage > 0:
             fully_corrective_steps(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_fn, encode_position_fn, net_ensemble_coarse, net_ensemble_fine, stage)
 
         validate(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_fn, encode_position_fn, stage + 1, 0, net_ensemble_coarse, net_ensemble_fine)
+
+        if MAX_MINUTES:
+            if time.time() - start > MAX_MINUTES * 60:
+                print("Time is up! Closing training...")
+                break
     ###################################################################################################################
-    print("- DONE -")
+    print("- TRAIN DONE -")
 
 
 def train_weak(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_fn, encode_position_fn,
@@ -183,10 +165,10 @@ def train_weak(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction
             model_coarse.train()
 
         # UPDATE LR #
-        num_decay_steps = cfg.scheduler.lr_decay * 1000  # * 1000
+        num_decay_steps = cfg.scheduler.lr_decay_weak # * 1000
         lr_new = cfg.optimizer.lr * (
-                # cfg.scheduler.lr_decay_factor ** ((epoch + stage*cfg.experiment.weak_train_iters) / num_decay_steps)
-                cfg.scheduler.lr_decay_factor ** (epoch / num_decay_steps)
+                cfg.scheduler.lr_decay_factor_weak ** (epoch / num_decay_steps) if cfg.scheduler.lr_reset_weak else
+                cfg.scheduler.lr_decay_factor_weak ** ((epoch + stage*cfg.experiment.weak_train_iters) / num_decay_steps)
         )
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr_new
@@ -211,7 +193,8 @@ def train_weak(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction
             rgb_coarse_ensemble, _, _, rgb_fine_ensemble, _, _ = out_ensemble  # predictions, one pixel for each ray (default: 1024 pixels)
             penultimate_features_coarse, penultimate_features_fine = penultimate_features
             grad_direction_coarse = -(rgb_coarse_ensemble[..., :3] - target_ray_values[..., :3])  # grad_direction = y / (1.0 + torch.exp(y * out))
-            grad_direction_fine = -(rgb_fine_ensemble[..., :3] - target_ray_values[..., :3])
+            if rgb_fine_ensemble is not None:
+                grad_direction_fine = -(rgb_fine_ensemble[..., :3] - target_ray_values[..., :3])
 
         out, _, _, _ = run_one_iter_of_nerf(
             hwf,
@@ -264,6 +247,11 @@ def train_weak(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction
             if os.path.isfile(checkpoint_path):
                 wandb.log({"checkpoint(KB)": os.path.getsize(checkpoint_path) / 1000})
 
+        if MAX_MINUTES:
+            if time.time() - start > MAX_MINUTES * 60:
+                print("Time is up! Closing weak training...")
+                break
+
     return model_coarse, model_fine
 
 
@@ -286,9 +274,19 @@ def fully_corrective_steps(cfg, hwf, USE_CACHED_DATASET, device, data_dict, enco
     for epoch in pbar:
 
         # UPDATE LR #
-        num_decay_steps = cfg.scheduler.lr_decay * 1000  # * 1000
+        tot_iters_per_weak = cfg.experiment.corrective_iters + cfg.experiment.weak_train_iters
+        num_decay_steps = cfg.scheduler.lr_decay_corrective
         lr_new = cfg.optimizer.lr * (
-                cfg.scheduler.lr_decay_factor ** ((epoch + stage*cfg.experiment.corrective_iters) / num_decay_steps)
+                cfg.scheduler.lr_decay_factor_corrective ** (epoch / num_decay_steps) if cfg.scheduler.lr_reset_corrective else
+                # cfg.scheduler.lr_decay_factor_corrective ** ((
+                #         epoch + stage * tot_iters_per_weak * ((epoch+1)/cfg.scheduler.lr_decay_corrective_peaked)
+                #     ) / num_decay_steps
+                # )
+
+                cfg.scheduler.lr_decay_corrective_peaked*cfg.scheduler.lr_decay_factor_corrective ** ((
+                        (epoch + (stage * tot_iters_per_weak)*cfg.scheduler.lr_decay_corrective_peaked)
+                    ) / num_decay_steps
+                )
         )
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr_new
@@ -326,6 +324,11 @@ def fully_corrective_steps(cfg, hwf, USE_CACHED_DATASET, device, data_dict, enco
 
         psnr = mse2psnr(loss.item())
         corrective_step_log(cfg, coarse_loss, epoch, fine_loss, loss, lr_new, pbar, psnr, stage, net_ensemble_coarse, net_ensemble_fine)
+
+        if MAX_MINUTES:
+            if time.time() - start > MAX_MINUTES * 60:
+                print("Time is up! Closing fully corrective phase...")
+                break
 
 
 def weak_train_log(cfg, device, epoch, stage, loss, coarse_loss, fine_loss, psnr, lr, pbar, rgb_coarse, rgb_fine, target_ray_values_coarse, target_ray_values_fine):
@@ -478,15 +481,17 @@ def validate(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_f
         loss, fine_loss = None, None
         if rgb_fine is not None:
             fine_loss = img2mse(rgb_fine[..., :3], target_ray_values[..., :3])
-        loss = coarse_loss + fine_loss
-        psnr = mse2psnr(loss.item())
+            loss = coarse_loss + fine_loss
+        else:
+            loss = coarse_loss
+        psnr = mse2psnr(loss.item()) # TODO: check this
 
-        if fine_loss is not None:
-            wandb.log({
-                "Ensemble/validation/loss_fine": fine_loss,
-            }, commit=False)
+        if (not datafile_idx) or cfg.experiment.n_stages<=1: # only validation during weak learning uses datafile_idx, I don't want to log that, too noisy (apart from single learner)
+            if fine_loss is not None:
+                wandb.log({
+                    "Ensemble/validation/loss_fine": fine_loss,
+                }, commit=False)
 
-        if not datafile_idx: # only validation during weak learning uses datafile_idx, I don't want to log that, too noisy
             wandb.log({
                 "stage": stage,
                 "epoch": epoch,
@@ -524,6 +529,7 @@ def validate(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_f
 
 
 if __name__ == "__main__":
+    MAX_MINUTES=None
     start = time.time()
     main()
     print("seconds: ", time.time() - start)
