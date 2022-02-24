@@ -153,7 +153,11 @@ def load_config():
     parser.add_argument("--n_stages", type=int, 
                         help='final number of weak learners')
     parser.add_argument("--boost_rate", type=float, 
-                        help='boosting rate of grownet')
+                        help='starting boosting rate of grownet')
+    parser.add_argument("--learn_boost_rate", type=str_to_bool,
+                        help="Update boost rate with training. Default=False")
+    parser.add_argument("--propagate_context", type=str_to_bool,
+                        help="Propagation of the penultimate layer to the input of the next weak learner. Default=True")
     parser.add_argument("--render_activation_fn", type=str, 
                         help='torch activation function to use (sigmoid, tanh, ...)')
 
@@ -165,6 +169,8 @@ def load_config():
                         help='multiplier used to create peaks in the scheduler (works only if lr_reset_corrective: False)')
     parser.add_argument("--no_fine", type=str_to_bool,
                         help="Wether to use the fine model")
+    parser.add_argument("--hierarchical_factor", type=float, 
+                        help='weak hidden size = hidden_size*factor**stage')
 
     args = parser.parse_args()
 
@@ -233,6 +239,8 @@ def load_config():
         cfg.experiment.n_stages = args.n_stages
     if args.boost_rate is not None:
         cfg.experiment.boost_rate = args.boost_rate
+    if args.learn_boost_rate is not None:
+        cfg.experiment.learn_boost_rate = args.learn_boost_rate
     if args.render_activation_fn is not None:
         cfg.experiment.render_activation_fn = args.render_activation_fn
     if args.lr_decay_corrective_peaked is not None:
@@ -245,6 +253,11 @@ def load_config():
         cfg.scheduler.lr_reset_weak = args.lr_reset_weak
     if args.lr_reset_corrective is not None:
         cfg.scheduler.lr_reset_corrective = args.lr_reset_corrective
+    if args.hierarchical_factor is not None:
+        cfg.models.coarse.hierarchical_factor = args.hierarchical_factor
+        cfg.models.fine.hierarchical_factor = args.hierarchical_factor
+    if args.propagate_context is not None:
+        cfg.experiment.propagate_context = args.propagate_context
     
 
     return cfg, args
@@ -283,7 +296,8 @@ def load_checkpoint(configargs, device, net_ensemble_coarse, net_ensemble_fine):
     run_id = checkpoint["run_id"]
 
     # Load weak models
-    weak_model_coarse, weak_model_fine = get_model_coarse(cfg, start_stage), get_model_fine(cfg, start_stage)
+    weak_model_coarse = get_model_coarse(cfg, start_stage)
+    weak_model_fine = get_model_fine(cfg, start_stage)
     weak_model_coarse.load_state_dict(checkpoint["model_coarse_state_dict"])
     weak_model_coarse.to(device)
     if checkpoint["model_fine_state_dict"]:
@@ -308,34 +322,40 @@ def load_checkpoint(configargs, device, net_ensemble_coarse, net_ensemble_fine):
 
 
 def get_model_coarse(cfg, stage):
+    if not cfg.experiment.propagate_context:
+        stage = 0
     model_coarse = getattr(models, cfg.models.coarse.type)(
         num_layers=cfg.models.coarse.num_layers,
-        hidden_size=cfg.models.coarse.hidden_size,
+        hidden_size=int(cfg.models.coarse.hidden_size * cfg.models.coarse.hierarchical_factor**stage),
         skip_connect_every=cfg.models.coarse.skip_connect_every,
         num_encoding_fn_xyz=cfg.models.coarse.num_encoding_fn_xyz,
         num_encoding_fn_dir=cfg.models.coarse.num_encoding_fn_dir,
         include_input_xyz=cfg.models.coarse.include_input_xyz,
         include_input_dir=cfg.models.coarse.include_input_dir,
         use_viewdirs=cfg.models.coarse.use_viewdirs,
-        append_penultimate=stage
+        append_penultimate=stage,
+        prev_penultimate_size=int(cfg.models.coarse.hidden_size * cfg.models.coarse.hierarchical_factor**(stage-1))
     )
     return model_coarse
 
 
 def get_model_fine(cfg, stage):
+    if not cfg.experiment.propagate_context:
+        stage = 0
     model_fine = None
     # if hasattr(cfg.models, "fine"):
     if not cfg.models.no_fine:
         model_fine = getattr(models, cfg.models.fine.type)(
             num_layers=cfg.models.fine.num_layers,
-            hidden_size=cfg.models.fine.hidden_size,
+            hidden_size=int(cfg.models.fine.hidden_size * cfg.models.fine.hierarchical_factor**stage),
             skip_connect_every=cfg.models.fine.skip_connect_every,
             num_encoding_fn_xyz=cfg.models.fine.num_encoding_fn_xyz,
             num_encoding_fn_dir=cfg.models.fine.num_encoding_fn_dir,
             include_input_xyz=cfg.models.fine.include_input_xyz,
             include_input_dir=cfg.models.fine.include_input_dir,
             use_viewdirs=cfg.models.fine.use_viewdirs,
-            append_penultimate=stage
+            append_penultimate=stage,
+            prev_penultimate_size=int(cfg.models.fine.hidden_size * cfg.models.fine.hierarchical_factor**(stage-1))
         )
     return model_fine
 
@@ -468,7 +488,7 @@ def get_random_rays(cfg, hwf, USE_CACHED_DATASET, device, data_dict):
         - None | list[int] i_train: indices of data images used for training, ignored if using cached dataset
         - None | torch.Tensor images: loaded dataset [H,W,N,RGB], ignored if using cached dataset
         - None | torch.Tensor poses: camera parameters, one camera for each image. Ignored if using cached dataset
-        - list[str] | None train_paths: one path for each training image, ignored if dataset is not cached
+        - list[str] | None train_paths: one path for each training image, ignored if dataset is NOT cached
     :return: hwf, ray_directions, ray_origins, target_ray_values
     :rtype: tuple[ list[int,int,float], torch.Tensor, torch.Tensor, torch.Tensor]
     """

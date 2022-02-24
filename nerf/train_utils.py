@@ -43,14 +43,18 @@ def run_network(network_fn, pts, ray_batch, chunksize, embed_fn, embeddirs_fn, p
     preds = [p[1] for p in preds]
 
     radiance_field = torch.cat(preds, dim=0)
+    if len(radiance_field.shape) == 1:  # needed only for the first stage when ensemble is empty
+        radiance_field = radiance_field.expand(pts_flat.shape[0], radiance_field.shape[-1])
     radiance_field = radiance_field.reshape(
         list(pts.shape[:-1]) + [radiance_field.shape[-1]]
     )
 
-    radiance_field_penultimate = torch.cat(preds_penultimate, dim=0)
-    radiance_field_penultimate = radiance_field_penultimate.reshape(
-        list(pts.shape[:-1]) + [radiance_field_penultimate.shape[-1]]
-    )
+    radiance_field_penultimate = None
+    if preds_penultimate[0] is not None:
+        radiance_field_penultimate = torch.cat(preds_penultimate, dim=0)
+        radiance_field_penultimate = radiance_field_penultimate.reshape(
+            list(pts.shape[:-1]) + [radiance_field_penultimate.shape[-1]]
+        )
     return radiance_field, radiance_field_penultimate
 
 
@@ -168,8 +172,7 @@ def predict_and_render_radiance(
             )
             z_samples = z_samples.detach()
 
-            z_vals, _ = torch.sort(torch.cat((z_vals, z_samples), dim=-1), dim=-1)
-            # pts -> (N_rays, N_samples + N_importance, 3)
+            z_vals, _ = torch.sort(torch.cat((z_vals, z_samples), dim=-1), dim=-1)  # pts -> (N_rays, N_samples + N_importance, 3)
             pts = ro[..., None, :] + rd[..., None, :] * z_vals[..., :, None]
             pts_and_zvals[1] = pts, z_vals
         else:

@@ -106,22 +106,39 @@ def main():
             log_sampling=cfg.models.coarse.log_sampling_dir,
         )
 
-    net_ensemble_coarse = DynamicNet(torch.Tensor([0.0, 0.0, 0.0, 0.0]).to(device), cfg.experiment.boost_rate, device)
-    net_ensemble_fine = None
-    if hasattr(cfg.models, "fine"):
-        net_ensemble_fine = DynamicNet(torch.Tensor([0.0, 0.0, 0.0, 0.0]).to(device), cfg.experiment.boost_rate, device)
+    if checkpoint["ensemble_coarse_state_dict"]:
+        net_ensemble_coarse = DynamicNet(torch.Tensor([0.0, 0.0, 0.0, 0.0]).to(device), cfg.experiment.boost_rate, device, cfg.experiment.learn_boost_rate, cfg.experiment.propagate_context)
+        net_ensemble_fine = None
+        if hasattr(cfg.models, "fine"):
+            net_ensemble_fine = DynamicNet(torch.Tensor([0.0, 0.0, 0.0, 0.0]).to(device), cfg.experiment.boost_rate, device, cfg.experiment.learn_boost_rate, cfg.experiment.propagate_context)
 
-    net_ensemble_coarse.load_state_dict(checkpoint["ensemble_coarse_state_dict"], cfg, get_model_coarse)
-    print("Found coarse model.")
-    if checkpoint["ensemble_fine_state_dict"]:
-        try:
-            net_ensemble_fine.load_state_dict(checkpoint["ensemble_fine_state_dict"], cfg, get_model_fine)
-            print("Found fine model.")
-        except:
-            print(
-                "The checkpoint has a fine-level model, but it could "
-                "not be loaded (possibly due to a mismatched config file."
-            )
+        net_ensemble_coarse.load_state_dict(checkpoint["ensemble_coarse_state_dict"], cfg, get_model_coarse)
+        print("Found coarse model.")
+        if checkpoint["ensemble_fine_state_dict"]:
+            try:
+                net_ensemble_fine.load_state_dict(checkpoint["ensemble_fine_state_dict"], cfg, get_model_fine)
+                print("Found fine model.")
+            except:
+                print(
+                    "The checkpoint has a fine-level model, but it could "
+                    "not be loaded (possibly due to a mismatched config file."
+                )
+        net_ensemble_coarse.eval()
+        if net_ensemble_fine:
+            net_ensemble_fine.eval()
+    else:
+        # Load weak models
+        weak_model_coarse, weak_model_fine = get_model_coarse(cfg, 0), get_model_fine(cfg, 0)
+        weak_model_coarse.load_state_dict(checkpoint["model_coarse_state_dict"])
+        weak_model_coarse.to(device)
+        net_ensemble_coarse = weak_model_coarse
+        print("No ensemble, found coarse weak.")
+
+        if checkpoint["model_fine_state_dict"]:
+            weak_model_fine.load_state_dict(checkpoint["model_fine_state_dict"])
+            weak_model_fine.to(device)
+            print("Found fine weak.")
+            net_ensemble_fine = weak_model_fine
 
     if "height" in checkpoint.keys():
         hwf[0] = checkpoint["height"]
@@ -129,10 +146,6 @@ def main():
         hwf[1] = checkpoint["width"]
     if "focal_length" in checkpoint.keys():
         hwf[2] = checkpoint["focal_length"]
-
-    net_ensemble_coarse.to_eval()
-    if net_ensemble_fine:
-        net_ensemble_fine.to_eval()
 
     render_poses = render_poses.float().to(device)
 

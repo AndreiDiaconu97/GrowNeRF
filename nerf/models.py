@@ -194,6 +194,7 @@ class FlexibleNeRFModel(torch.nn.Module):
             include_input_dir=True,
             use_viewdirs=True,
             append_penultimate=False,
+            prev_penultimate_size=0
     ):
         super(FlexibleNeRFModel, self).__init__()
 
@@ -208,7 +209,7 @@ class FlexibleNeRFModel(torch.nn.Module):
 
         input_xyz = self.dim_xyz
         if append_penultimate:
-            input_xyz = self.dim_xyz + hidden_size
+            input_xyz = self.dim_xyz + prev_penultimate_size
 
         self.layer1 = torch.nn.Linear(input_xyz, hidden_size)
         self.layers_xyz = torch.nn.ModuleList()
@@ -226,12 +227,12 @@ class FlexibleNeRFModel(torch.nn.Module):
             # This deviates from the original paper, and follows the code release instead.
             self.layers_dir.append(
                 # torch.nn.Linear(self.dim_dir + hidden_size, hidden_size // 2)
-                torch.nn.Linear(self.dim_dir + hidden_size, hidden_size // 1)
+                torch.nn.Linear(self.dim_dir + hidden_size, hidden_size // 2)
             )
 
             self.fc_alpha = torch.nn.Linear(hidden_size, 1)
             # self.fc_rgb = torch.nn.Linear(hidden_size // 2, 3)
-            self.fc_rgb = torch.nn.Linear(hidden_size // 1, 3)
+            self.fc_rgb = torch.nn.Linear(hidden_size // 2, 3)
             self.fc_feat = torch.nn.Linear(hidden_size, hidden_size)
         else:
             self.fc_out = torch.nn.Linear(hidden_size, 4)

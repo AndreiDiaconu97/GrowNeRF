@@ -7,20 +7,22 @@ experiment:
   # Seed for random number generators (for repeatability).
   randomseed: 42  # Cause, why not?
   # Number of training iterations after which to validate.
-  validate_every: 2000
+  validate_every: 1000
   # Number of training iterations after which to checkpoint.
   save_every: 20000
   # Number of training iterations after which to print progress.
   print_every: 100
 
   # ENSEMBLE SETTINGS #
-  weak_train_iters: 23000
+  weak_train_iters: 200000
   # Number of fully corrective steps per stage
   corrective_iters: 2000
   # Number of stages (determines final ensemble size)
-  n_stages: 8
+  n_stages: 1
   # Boosting rage
   boost_rate: 1.0
+  learn_boost_rate: False
+  propagate_context: True
 
   render_activation_fn: sigmoid
 
@@ -52,8 +54,9 @@ models:
   coarse:
     # Name of the torch.nn.Module class that implements the model.
     type: FlexibleNeRFModel
+    hierarchical_factor: 1.0
     # Number of layers in the model.
-    num_layers: 1
+    num_layers: 8
     # Number of hidden units in each layer of the MLP (multi-layer
     # perceptron).
     hidden_size: 128
@@ -85,8 +88,9 @@ models:
   fine:
     # Name of the torch.nn.Module class that implements the model.
     type: FlexibleNeRFModel
+    hierarchical_factor: 1.0
     # Number of layers in the model.
-    num_layers: 1
+    num_layers: 8
     # Number of hidden units in each layer of the MLP (multi-layer
     # perceptron).
     hidden_size: 128
@@ -124,12 +128,12 @@ optimizer:
 # Learning rate schedule.
 scheduler:
   # Exponentially decay learning rate (in 1000 steps)
-  lr_decay_weak: 200000
+  lr_decay_weak: 250000
   # Rate at which to apply this decay.
   lr_decay_factor_weak: 0.1
   lr_reset_weak: True
 
-  lr_decay_corrective: 200000
+  lr_decay_corrective: 250000
   lr_decay_factor_corrective: 0.1
   lr_reset_corrective: False
   
