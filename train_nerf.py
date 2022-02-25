@@ -459,9 +459,6 @@ def validate(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_f
     model_coarse.eval()
     if model_fine:
         model_coarse.eval()
-    # model_coarse.to_eval()
-    # if model_fine:
-    #     model_coarse.to_eval()
 
     start = time.time()
     with torch.no_grad():

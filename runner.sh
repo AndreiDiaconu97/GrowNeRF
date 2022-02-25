@@ -85,6 +85,3 @@ eval $run_lego --run-name kilonerf_D3W32_5000WI5000CI_H1.5_N40   --depth 3 --wid
 # MULTIRESOLUTION
 # - FROM BIG TO SMALL <- THIS
 # - FROM SMALL TO BIG
-
-# - sperimentare con positional encoding su singolo weak
-# - provare altro pos enc

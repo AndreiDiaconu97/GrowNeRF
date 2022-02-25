@@ -257,11 +257,11 @@ class FlexibleNeRFModel(torch.nn.Module):
         if self.use_viewdirs:
             feat = self.relu(self.fc_feat(x))
             # penultimate_xyz = feat # TODO: try to use this as penultimate
-            alpha = self.fc_alpha(x)
+            alpha = self.fc_alpha(x) # ACTIVATION: want to relu here
             x = torch.cat((feat, view), dim=-1)
             for l in self.layers_dir:
                 x = self.relu(l(x)) # view dependent penultimate
-            rgb = self.fc_rgb(x)
+            rgb = self.fc_rgb(x) # ACTIVATION: want to sigmoid here
             return penultimate_xyz, torch.cat((rgb, alpha), dim=-1)
         else:
             return penultimate_xyz, self.fc_out(x)
