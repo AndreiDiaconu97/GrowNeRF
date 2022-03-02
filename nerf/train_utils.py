@@ -43,7 +43,7 @@ def run_network(network_fn, pts, ray_batch, chunksize, embed_fn, embeddirs_fn, p
     preds = [p[1] for p in preds]
 
     radiance_field = torch.cat(preds, dim=0)
-    if len(radiance_field.shape) == 1:  # needed only for the first stage when ensemble is empty
+    if len(radiance_field.shape) == 1:  # used only for the first stage when ensemble is empty, but ignored for now as ensemble starts from stage 2
         radiance_field = radiance_field.expand(pts_flat.shape[0], radiance_field.shape[-1])
     radiance_field = radiance_field.reshape(
         list(pts.shape[:-1]) + [radiance_field.shape[-1]]

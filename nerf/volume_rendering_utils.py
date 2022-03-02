@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 from .nerf_helpers import cumprod_exclusive
 
@@ -39,7 +40,8 @@ def volume_render_radiance_field(
 
     if not activation_fn:
         activation_fn=torch.sigmoid
-    rgb = activation_fn(radiance_field[..., :3])  # torch.tanh(radiance_field[..., :3]) # for negative pixels # ACTIVATION: want to remove here
+    rgb = activation_fn(radiance_field[..., :3])  # torch.tanh(radiance_field[..., :3]) # for negative pixels # ACTIVATION
+    # rgb = radiance_field[..., :3]
     noise = 0.0
     if radiance_field_noise_std > 0.0:
         noise = (
@@ -51,7 +53,8 @@ def volume_render_radiance_field(
                 * radiance_field_noise_std
         )
         # noise = noise.to(radiance_field)
-    sigma_a = torch.nn.functional.relu(radiance_field[..., 3] + noise) # ACTIVATION: want to remove here
+    sigma_a = F.relu(radiance_field[..., 3] + noise) # ACTIVATION
+    # sigma_a = radiance_field[..., 3]
     alpha = 1.0 - torch.exp(-sigma_a * dists)
     samples_weights = alpha * cumprod_exclusive(1.0 - alpha + 1e-10)
 

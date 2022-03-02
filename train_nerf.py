@@ -246,6 +246,7 @@ def train_weak(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction
             validate(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_fn, encode_position_fn, stage, epoch, net_ensemble_coarse, net_ensemble_fine, is_weak=True, datafile_idx=1)
             net_ensemble_coarse.pop()
             net_ensemble_fine.pop()
+            # validate(cfg, hwf, USE_CACHED_DATASET, device, data_dict, encode_direction_fn, encode_position_fn, stage, epoch, model_coarse, model_fine, True, datafile_idx=1)
 
         # SAVE CHECKPOINT #
         if epoch % cfg.experiment.save_every == 0 or epoch == cfg.experiment.weak_train_iters - 1:

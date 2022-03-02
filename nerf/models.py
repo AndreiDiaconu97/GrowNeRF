@@ -1,5 +1,5 @@
 import torch
-
+import torch.nn.functional as F
 
 class VeryTinyNeRFModel(torch.nn.Module):
     r"""Define a "very tiny" NeRF model comprising three fully connected layers.
@@ -22,11 +22,10 @@ class VeryTinyNeRFModel(torch.nn.Module):
         # Layer 3 (default: 128 -> 4)
         self.layer3 = torch.nn.Linear(filter_size, 4)
         # Short hand for torch.nn.functional.relu
-        self.relu = torch.nn.functional.relu
 
     def forward(self, x):
-        x = self.relu(self.layer1(x))
-        x = self.relu(self.layer2(x))
+        x = F.relu(self.layer1(x))
+        x = F.relu(self.layer2(x))
         x = self.layer3(x)
         return x
 
@@ -63,17 +62,17 @@ class MultiHeadNeRFModel(torch.nn.Module):
         self.layer6 = torch.nn.Linear(hidden_size, 3)
 
         # Short hand for torch.nn.functional.relu
-        self.relu = torch.nn.functional.relu
+        F.relu = torch.nn.functional.relu
 
     def forward(self, x):
         x, view = x[..., : self.xyz_encoding_dims], x[..., self.xyz_encoding_dims:]
-        x = self.relu(self.layer1(x))
-        x = self.relu(self.layer2(x))
+        x = F.relu(self.layer1(x))
+        x = F.relu(self.layer2(x))
         sigma = self.layer3_1(x)
-        feat = self.relu(self.layer3_2(x))
+        feat = F.relu(self.layer3_2(x))
         x = torch.cat((feat, view), dim=-1)
-        x = self.relu(self.layer4(x))
-        x = self.relu(self.layer5(x))
+        x = F.relu(self.layer4(x))
+        x = F.relu(self.layer5(x))
         x = self.layer6(x)
         return torch.cat((x, sigma), dim=-1)
 
@@ -106,16 +105,15 @@ class ReplicateNeRFModel(torch.nn.Module):
         self.layer4 = torch.nn.Linear(hidden_size + self.dim_dir, hidden_size // 2)
         self.layer5 = torch.nn.Linear(hidden_size // 2, hidden_size // 2)
         self.fc_rgb = torch.nn.Linear(hidden_size // 2, 3)
-        self.relu = torch.nn.functional.relu
 
     def forward(self, x):
         xyz, direction = x[..., : self.dim_xyz], x[..., self.dim_xyz:]
-        x_ = self.relu(self.layer1(xyz))
-        x_ = self.relu(self.layer2(x_))
+        x_ = F.relu(self.layer1(xyz))
+        x_ = F.relu(self.layer2(x_))
         feat = self.layer3(x_)
         alpha = self.fc_alpha(x_)
-        y_ = self.relu(self.layer4(torch.cat((feat, direction), dim=-1)))
-        y_ = self.relu(self.layer5(y_))
+        y_ = F.relu(self.layer4(torch.cat((feat, direction), dim=-1)))
+        y_ = F.relu(self.layer5(y_))
         rgb = self.fc_rgb(y_)
         return torch.cat((rgb, alpha), dim=-1)
 
@@ -158,7 +156,6 @@ class PaperNeRFModel(torch.nn.Module):
         for i in range(3):
             self.layers_dir.append(torch.nn.Linear(128, 128))
         self.fc_rgb = torch.nn.Linear(128, 3)
-        self.relu = torch.nn.functional.relu
 
     def forward(self, x):
         xyz, dirs = x[..., : self.dim_xyz], x[..., self.dim_xyz:]
@@ -167,17 +164,17 @@ class PaperNeRFModel(torch.nn.Module):
                 x = self.layers_xyz[i](torch.cat((xyz, x), -1))
             else:
                 x = self.layers_xyz[i](x)
-            x = self.relu(x)
+            x = F.relu(x)
         feat = self.fc_feat(x)
         alpha = self.fc_alpha(feat)
         if self.use_viewdirs:
             x = self.layers_dir[0](torch.cat((feat, dirs), -1))
         else:
             x = self.layers_dir[0](feat)
-        x = self.relu(x)
+        x = F.relu(x)
         for i in range(1, 3):
             x = self.layers_dir[i](x)
-            x = self.relu(x)
+            x = F.relu(x)
         rgb = self.fc_rgb(x)
         return torch.cat((rgb, alpha), dim=-1)
 
@@ -237,8 +234,6 @@ class FlexibleNeRFModel(torch.nn.Module):
         else:
             self.fc_out = torch.nn.Linear(hidden_size, 4)
 
-        self.relu = torch.nn.functional.relu
-
     def forward(self, x, prev_penultimate=None):
         if self.use_viewdirs:
             xyz, view = x[..., : self.dim_xyz], x[..., self.dim_xyz:]
@@ -252,16 +247,18 @@ class FlexibleNeRFModel(torch.nn.Module):
         for i in range(len(self.layers_xyz)):
             if i % self.skip_connect_every == 0 and i > 0 and i != len(self.layers_xyz):
                 x = torch.cat((x, xyz), dim=-1)
-            x = self.relu(self.layers_xyz[i](x))
+            x = F.relu(self.layers_xyz[i](x))
         penultimate_xyz = x
         if self.use_viewdirs:
-            feat = self.relu(self.fc_feat(x))
+            feat = F.relu(self.fc_feat(x))
             # penultimate_xyz = feat # TODO: try to use this as penultimate
-            alpha = self.fc_alpha(x) # ACTIVATION: want to relu here
+            # alpha = F.relu(self.fc_alpha(x)) # ACTIVATION
+            alpha = self.fc_alpha(x) # ACTIVATION
             x = torch.cat((feat, view), dim=-1)
             for l in self.layers_dir:
-                x = self.relu(l(x)) # view dependent penultimate
-            rgb = self.fc_rgb(x) # ACTIVATION: want to sigmoid here
+                x = F.relu(l(x)) # view dependent penultimate
+            # rgb = torch.sigmoid(self.fc_rgb(x)) # ACTIVATION
+            rgb = self.fc_rgb(x) # ACTIVATIONe
             return penultimate_xyz, torch.cat((rgb, alpha), dim=-1)
         else:
             return penultimate_xyz, self.fc_out(x)

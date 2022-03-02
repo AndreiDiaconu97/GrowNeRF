@@ -195,7 +195,7 @@ def load_config():
         cfg.optimizer.lr = args.lr
     if args.lr_decay_weak is not None:
         cfg.scheduler.lr_decay_weak = args.lr_decay_weak
-    if args.lr_decay_weak is not None:
+    if args.lr_decay_corrective is not None:
         cfg.scheduler.lr_decay_corrective = args.lr_decay_corrective
     if args.lr_decay_factor_weak is not None:
         cfg.scheduler.lr_decay_factor_weak = args.lr_decay_factor_weak

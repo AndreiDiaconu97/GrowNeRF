@@ -81,17 +81,14 @@ class DynamicNet:
         if len(self.models) == 0:
             return None, self.c0
         middle_feat_cum = None
-        prediction = None
-        # print("Forward:")
+        preds = []
         with torch.no_grad():
             for m in self.models:
-                if middle_feat_cum is None:
-                    middle_feat_cum, prediction = m(x, middle_feat_cum) if self.propagate_context else m(x, None)
-                    # print(torch.mean(prediction[...,:-1]), torch.mean(prediction[..., -1:]))
-                else:
-                    middle_feat_cum, pred =  m(x, middle_feat_cum) if self.propagate_context else m(x, None)
-                    prediction += pred
-                    # print(torch.mean(pred[...,:-1]), torch.mean(pred[..., -1:]))
+                middle_feat_cum, pred =  m(x, middle_feat_cum if self.propagate_context else None)
+                preds.append(pred)
+        prediction = sum(preds)
+        # prediction = torch.stack(preds)
+        # prediction = torch.cat((torch.sum(prediction[...,:3], dim=0),torch.sum(prediction[...,3:], dim=0)), dim=-1)
         return middle_feat_cum, self.c0 + self.boost_rate * prediction
 
     def forward_grad(self, x):
@@ -101,9 +98,10 @@ class DynamicNet:
         middle_feat_cum = None
         preds = []
         for m in self.models:
-            middle_feat_cum, pred =  m(x, middle_feat_cum) if self.propagate_context else m(x, None)
+            middle_feat_cum, pred =  m(x, middle_feat_cum if self.propagate_context else None)
             preds.append(pred)
         prediction = sum(preds)
+        # prediction = torch.mean(torch.stack(preds), dim=0)
         return middle_feat_cum, self.c0 + self.boost_rate * prediction
 
     def __call__(self, x):
