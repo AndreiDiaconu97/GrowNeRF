@@ -322,8 +322,11 @@ def load_checkpoint(configargs, device, net_ensemble_coarse, net_ensemble_fine):
 
 
 def get_model_coarse(cfg, stage):
-    if not cfg.experiment.propagate_context:
+    if hasattr(cfg.experiment, "propagate_context") and not cfg.experiment.propagate_context:
         stage = 0
+    if not hasattr(cfg.models.coarse, "hierarchical_factor"):
+        cfg.models.coarse.hierarchical_factor = 1.0
+
     model_coarse = getattr(models, cfg.models.coarse.type)(
         num_layers=cfg.models.coarse.num_layers,
         hidden_size=int(cfg.models.coarse.hidden_size * cfg.models.coarse.hierarchical_factor**stage),
@@ -340,11 +343,14 @@ def get_model_coarse(cfg, stage):
 
 
 def get_model_fine(cfg, stage):
-    if not cfg.experiment.propagate_context:
+    if hasattr(cfg.experiment, "propagate_context") and not cfg.experiment.propagate_context:
         stage = 0
+    if not hasattr(cfg.models.fine, "hierarchical_factor"):
+        cfg.models.fine.hierarchical_factor = 1.0
+
     model_fine = None
     # if hasattr(cfg.models, "fine"):
-    if not cfg.models.no_fine:
+    if (not hasattr(cfg.models, "no_fine")) or (not cfg.models.no_fine):
         model_fine = getattr(models, cfg.models.fine.type)(
             num_layers=cfg.models.fine.num_layers,
             hidden_size=int(cfg.models.fine.hidden_size * cfg.models.fine.hierarchical_factor**stage),

@@ -107,10 +107,13 @@ def main():
         )
 
     if checkpoint["ensemble_coarse_state_dict"]:
-        net_ensemble_coarse = DynamicNet(torch.Tensor([0.0, 0.0, 0.0, 0.0]).to(device), cfg.experiment.boost_rate, device, cfg.experiment.learn_boost_rate, cfg.experiment.propagate_context)
+        prop_context = None
+        if hasattr(cfg.experiment, "propagate_context"):
+            prop_context = cfg.experiment.propagate_context
+        net_ensemble_coarse = DynamicNet(torch.Tensor([0.0, 0.0, 0.0, 0.0]).to(device), cfg.experiment.boost_rate, device, cfg.experiment.learn_boost_rate, prop_context)
         net_ensemble_fine = None
         if hasattr(cfg.models, "fine"):
-            net_ensemble_fine = DynamicNet(torch.Tensor([0.0, 0.0, 0.0, 0.0]).to(device), cfg.experiment.boost_rate, device, cfg.experiment.learn_boost_rate, cfg.experiment.propagate_context)
+            net_ensemble_fine = DynamicNet(torch.Tensor([0.0, 0.0, 0.0, 0.0]).to(device), cfg.experiment.boost_rate, device, cfg.experiment.learn_boost_rate, prop_context)
 
         net_ensemble_coarse.load_state_dict(checkpoint["ensemble_coarse_state_dict"], cfg, get_model_coarse)
         print("Found coarse model.")
